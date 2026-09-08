@@ -45,7 +45,47 @@ python -m parts_inflation.cli profile --input-dir data/raw
 python -m parts_inflation.cli validate --input-dir data/raw --config config/model_config.xlsx
 python -m parts_inflation.cli backtest --input-dir data/raw --config config/model_config.xlsx
 python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
+python -m parts_inflation.cli historical-actuals --input-dir data/raw --config config/model_config.xlsx --output-dir outputs
 ```
+
+### Historical Actual Inflation
+
+Distinct from the forward forecast. Reproduces spend-weighted and typical-part historical rates via Robust Capped Törnqvist and an independent Huber repeat-purchase regression.
+
+```bash
+# macOS / Linux
+python -m parts_inflation.cli historical-actuals \
+  --input-dir data/raw \
+  --config config/model_config.xlsx \
+  --output-dir outputs
+
+# Or double-click run_historical_actuals_mac.command after setup
+
+# Windows
+python -m parts_inflation.cli historical-actuals --input-dir data\raw --config config\model_config.xlsx --output-dir outputs
+# Or double-click run_historical_actuals_windows.bat
+```
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--scope` | Headline emphasis: `physical_inputs` (default) \| `inventory_only` \| `all_po_lines` (all three are always calculated) |
+| `--winsor-lower` / `--winsor-upper` | Log-relative winsorization quantiles (default 0.01 / 0.99) |
+| `--weight-cap-quantile` | Cap for Törnqvist / regression spend shares (default 0.95) |
+| `--min-pair-gap-days` | Minimum adjacent-pair gap for regression (default 30) |
+| `--include-open-orders` | `true` \| `false` |
+| `--fast` / `--no-cache` | Development / cache control |
+
+Outputs:
+
+- `outputs/historical_actual_inflation_YYYY-MM-DD_HHMMSS.xlsx` — Executive Summary, Scope / Category / Method Sensitivity, Regression, Matched Part Detail, Spend Reconciliation, Data Quality, Methodology, Run Information
+- `outputs/historical_scope_results.csv` (and category / method / regression / matched-part CSVs)
+- `outputs/historical_actual_inflation_summary.md`
+
+**Physical-input scope (exact normalized Description):** Inventory, Production Supplies, Operating Supplies, Production Aids, Small Tools. Weights use `PO Value` (not Cost×Qty Ordered). FY2026 is an aligned YTD comparison through July 9 and is not chained after FY2025.
+
+Principal validation targets from the supplied workbooks (calculated, not hard-coded): ~7.7–7.9% annual spend-weighted inflation through FY2025; ~3% typical-part; ~3.0% aligned FY2026 YTD.
 
 Useful flags on `run`:
 
@@ -89,27 +129,32 @@ Raw files are never modified. Macros in `.xlsm` are not executed.
 
 ## Outputs
 
-Each run writes:
+Each `run` writes:
 
 - `outputs/parts_inflation_results_YYYY-MM-DD_HHMMSS.xlsx` — Dashboard, Controls Used, Scope Sensitivity, Historical Index, Category Results, Part Forecasts, Backtests, Scope Mapping, Data Quality, Methodology, Run Information
 - `outputs/logs/parts_inflation_*.log`
+
+Each `historical-actuals` run writes the historical workbook / CSV / Markdown files listed above (separate from forecast outputs).
 
 ## Tests
 
 ```bash
 source .venv/bin/activate
 pytest -q
-# Include smoke test against real workbooks:
+# Include smoke / historical integration against real workbooks:
 pytest -q -m integration
 ```
 
 ## Honest limitations
 
-- Roughly four years of history; FY2026 is incomplete.
+- Roughly four years of history; FY2026 is incomplete (historical YTD aligned through July 9).
 - Supplier, currency, unit of measure, PO number, contract status, and facility are unavailable—so apparent price changes may include supplier switches, spec changes, currency, contracts, emergency buys, or UoM changes.
-- Most distinct parts are not observed across multiple fiscal years; category/overall fallback is common.
+- Most distinct parts are not observed across multiple fiscal years; matched spend coverage for physical inputs is typically ~45–58% in headline comparisons.
+- `PO Value` and `Cost × Qty Ordered` disagree materially in aggregate; historical weights always use `PO Value`.
+- Spend-weighted rates describe client cost exposure; unweighted rates describe the typical matched part—they are not the same.
+- Historical actual inflation is not automatically the best forward forecast; the two analyses remain distinct.
 - Horizons beyond 24 months are **scenarios** with widening uncertainty, not precise forecasts.
-- A client-approved scope/category map and planned basket would improve results materially.
+- A client-approved scope/category map and planned basket would improve forecast results materially.
 - Architecture is modular so older years and richer fields can be added without a rewrite.
 
 ## Project layout
@@ -122,6 +167,8 @@ parts-inflation/
 ├── src/parts_inflation/
 ├── tests/
 ├── outputs/
+├── run_mac.command / run_windows.bat
+├── run_historical_actuals_mac.command / run_historical_actuals_windows.bat
 ├── requirements.txt
 └── README.md
 ```

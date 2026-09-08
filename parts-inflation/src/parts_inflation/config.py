@@ -110,6 +110,11 @@ class ControlDefaults(BaseModel):
     lambda_gamma: float = 2.0
     huber_delta: float = 1.5
     cache_enabled: bool = True
+    # Historical actuals (optional; CLI flags override)
+    historical_winsor_lower: float = 0.01
+    historical_winsor_upper: float = 0.99
+    historical_weight_cap_quantile: float = 0.95
+    historical_min_pair_gap_days: int = 30
 
     @field_validator(
         "include_open_orders_as_prices",
@@ -189,6 +194,10 @@ CONTROL_DESCRIPTIONS: dict[str, str] = {
     "lambda_gamma": "Ridge penalty on category quantity-elasticity deviations",
     "huber_delta": "Huber loss threshold in residual sigma units",
     "cache_enabled": "Use Parquet cache for cleaned data and pairs",
+    "historical_winsor_lower": "Historical actuals: lower quantile for log-relative winsorization",
+    "historical_winsor_upper": "Historical actuals: upper quantile for log-relative winsorization",
+    "historical_weight_cap_quantile": "Historical actuals: share/weight cap quantile (default 0.95)",
+    "historical_min_pair_gap_days": "Historical actuals: minimum adjacent-pair gap (days) for regression",
 }
 
 

@@ -142,5 +142,51 @@ def run_cmd(
         raise typer.Exit(code=1) from exc
 
 
+@app.command("historical-actuals")
+def historical_actuals_cmd(
+    input_dir: Path = typer.Option(_default_input(), "--input-dir", help="Directory of PO workbooks"),
+    config: Path = typer.Option(_default_config(), "--config"),
+    output_dir: Path = typer.Option(_default_output(), "--output-dir"),
+    scope: str = typer.Option(
+        "physical_inputs",
+        "--scope",
+        help="Headline scope: physical_inputs|inventory_only|all_po_lines",
+    ),
+    winsor_lower: Optional[float] = typer.Option(None, "--winsor-lower"),
+    winsor_upper: Optional[float] = typer.Option(None, "--winsor-upper"),
+    weight_cap_quantile: Optional[float] = typer.Option(None, "--weight-cap-quantile"),
+    min_pair_gap_days: Optional[int] = typer.Option(None, "--min-pair-gap-days"),
+    include_open_orders: str = typer.Option(
+        "true",
+        "--include-open-orders",
+        help="true|false — keep open orders as price observations",
+    ),
+    fast: bool = typer.Option(False, "--fast", help="Faster development path (same formulas)"),
+    no_cache: bool = typer.Option(False, "--no-cache"),
+) -> None:
+    """Reproduce Historical Actual Inflation (Robust Capped Törnqvist + Huber validation)."""
+    from parts_inflation.historical_pipeline import run_historical_actuals
+
+    try:
+        include = str(include_open_orders).strip().lower() in {"true", "1", "yes", "y"}
+        payload = run_historical_actuals(
+            input_dir=input_dir,
+            config_path=config,
+            output_dir=output_dir,
+            scope=scope,
+            winsor_lower=winsor_lower,
+            winsor_upper=winsor_upper,
+            weight_cap_quantile=weight_cap_quantile,
+            min_pair_gap_days=min_pair_gap_days,
+            include_open_orders=include,
+            fast=fast,
+            no_cache=no_cache,
+        )
+        excel = payload.get("output_paths", {}).get("excel")
+        console.print(f"[green]Historical actuals written to[/green] {excel}")
+    except Exception as exc:
+        console.print(f"[red]ERROR:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
 if __name__ == "__main__":
     app()
