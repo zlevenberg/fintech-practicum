@@ -82,6 +82,29 @@ def test_backtest_holdout_retains_but_robustly_bounds_price_basis_extreme(cfg):
     assert actual.loc[actual["actual_extreme_flag"], "weight"].sum() < 0.5
 
 
+def test_backtest_actual_is_horizon_normalized_and_stale_prices_are_excluded(cfg):
+    daily = pd.DataFrame(
+        {
+            "PartKey": ["A", "B", "A", "B"],
+            "po_date": pd.to_datetime(
+                ["2024-01-01", "2023-12-31", "2025-07-02", "2025-07-02"]
+            ),
+            "price": [100.0, 100.0, 121.0, 121.0],
+            "qty": [1.0] * 4,
+            "spend": [100.0] * 4,
+            "approved_category": ["Inventory"] * 4,
+        }
+    )
+    actual = _actual_matched_basket(daily, pd.Timestamp("2024-07-02"), 12, cfg)
+    assert set(actual["PartKey"]) == {"A"}
+    assert actual.iloc[0]["gap_days"] == 548
+    assert actual.iloc[0]["raw_actual_multiplier"] == pytest.approx(1.21)
+    assert actual.iloc[0]["actual_multiplier"] == pytest.approx(
+        1.21 ** (365 / 548), rel=1e-5
+    )
+    assert actual.iloc[0]["stale_parts_excluded"] == 1
+
+
 def test_realized_and_committed_prices_are_separate(cfg):
     cleaned = clean_po_lines(_raw_rows(), cfg)
     classified, _ = apply_scope_and_category(cleaned, cfg)

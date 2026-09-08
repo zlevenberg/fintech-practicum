@@ -100,6 +100,7 @@ class ControlDefaults(BaseModel):
     selected_model_mode: SelectedModelMode = SelectedModelMode.best_backtest
     fast_mode: bool = False
     material_wape_improvement: float = 0.01
+    backtest_max_actual_gap_days: int = 548
     extreme_ratio_low: float = 0.25
     extreme_ratio_high: float = 4.0
     extreme_ratio_max_days: int = 548  # ~18 months
@@ -196,6 +197,7 @@ CONTROL_DESCRIPTIONS: dict[str, str] = {
     "selected_model_mode": "best_backtest or force a specific model family",
     "fast_mode": "Reduce bootstrap iterations and lambda grid size only (does not subsample pairs)",
     "material_wape_improvement": "Relative WAPE improvement required to prefer complexity",
+    "backtest_max_actual_gap_days": "Maximum base-to-holdout price gap used in a 12-month backtest; longer gaps are stale and excluded",
     "extreme_ratio_low": "Flag price ratios below this over short intervals",
     "extreme_ratio_high": "Flag price ratios above this over short intervals",
     "extreme_ratio_max_days": "Max interval days for extreme ratio flags (~18 months)",

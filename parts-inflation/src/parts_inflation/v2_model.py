@@ -481,12 +481,27 @@ def _actual_matched_basket(
         .groupby("PartKey", as_index=False)
         .head(1)
     )
-    out = base[["PartKey", "price", "spend", "approved_category"]].merge(
-        actual[["PartKey", "price"]], on="PartKey", suffixes=("_base", "_actual")
+    out = base[["PartKey", "po_date", "price", "spend", "approved_category"]].merge(
+        actual[["PartKey", "po_date", "price"]],
+        on="PartKey",
+        suffixes=("_base", "_actual"),
     )
     out = out.loc[out["price_base"].gt(0) & out["price_actual"].gt(0)].copy()
+    out["gap_days"] = (
+        pd.to_datetime(out["po_date_actual"]) - pd.to_datetime(out["po_date_base"])
+    ).dt.days
+    max_gap = config.controls.backtest_max_actual_gap_days if config else 548
+    stale_count = int(out["gap_days"].gt(max_gap).sum())
+    out = out.loc[out["gap_days"].gt(0) & out["gap_days"].le(max_gap)].copy()
+    if out.empty:
+        return out
     out["raw_actual_multiplier"] = out["price_actual"] / out["price_base"]
-    log_relative = np.log(out["raw_actual_multiplier"])
+    raw_log_relative = np.log(out["raw_actual_multiplier"])
+    horizon_days = max((target - cutoff).days, 1)
+    out["raw_actual_annualized_multiplier"] = np.exp(
+        raw_log_relative * horizon_days / out["gap_days"]
+    )
+    log_relative = np.log(out["raw_actual_annualized_multiplier"])
     winsor_lower = config.controls.benchmark_winsor_lower if config else 0.01
     winsor_upper = config.controls.benchmark_winsor_upper if config else 0.99
     absolute_low = config.controls.extreme_ratio_low if config else 0.25
@@ -495,9 +510,16 @@ def _actual_matched_basket(
     lower = max(float(q_low), float(np.log(absolute_low)))
     upper = min(float(q_high), float(np.log(absolute_high)))
     out["actual_multiplier"] = np.exp(log_relative.clip(lower=lower, upper=upper))
-    out["actual_extreme_flag"] = out["raw_actual_multiplier"].lt(absolute_low) | out[
-        "raw_actual_multiplier"
+    raw_q_low, raw_q_high = raw_log_relative.quantile([winsor_lower, winsor_upper])
+    raw_lower = max(float(raw_q_low), float(np.log(absolute_low)))
+    raw_upper = min(float(raw_q_high), float(np.log(absolute_high)))
+    out["unannualized_actual_multiplier"] = np.exp(
+        raw_log_relative.clip(lower=raw_lower, upper=raw_upper)
+    )
+    out["actual_extreme_flag"] = out["raw_actual_annualized_multiplier"].lt(absolute_low) | out[
+        "raw_actual_annualized_multiplier"
     ].gt(absolute_high)
+    out["stale_parts_excluded"] = stale_count
     out["weight"] = out["spend"].fillna(out["price_base"]).clip(lower=0)
     if not out.empty and out["weight"].sum() > 0:
         cap = float(out["weight"].quantile(0.95))
@@ -537,9 +559,74 @@ def run_composite_backtest(
             del actual, model, train_pairs, train_daily
             _release_iteration_memory()
             continue
-        actual_composite = float(np.sum(actual["weight"] * actual["actual_multiplier"]))
         # Basket weights are cutoff-only; future records cannot affect them.
-        weights = build_bucket_weights(classified.loc[pd.to_datetime(classified["effective_historical_date"]).le(cutoff)], cutoff, config)
+        weights = build_bucket_weights(
+            classified.loc[
+                pd.to_datetime(classified["effective_historical_date"]).le(cutoff)
+            ],
+            cutoff,
+            config,
+        )
+        actual["within_category_weight"] = actual["weight"] / actual.groupby(
+            "approved_category"
+        )["weight"].transform("sum")
+        actual["weighted_actual"] = (
+            actual["within_category_weight"] * actual["actual_multiplier"]
+        )
+        actual["weighted_unannualized"] = (
+            actual["within_category_weight"] * actual["unannualized_actual_multiplier"]
+        )
+        actual["weighted_gap_days"] = (
+            actual["within_category_weight"] * actual["gap_days"]
+        )
+        actual["weighted_extreme"] = (
+            actual["within_category_weight"] * actual["actual_extreme_flag"].astype(float)
+        )
+        category_actual = (
+            actual.groupby("approved_category", as_index=False)
+            .agg(
+                actual_multiplier=("weighted_actual", "sum"),
+                unannualized_multiplier=("weighted_unannualized", "sum"),
+                effective_gap_days=("weighted_gap_days", "sum"),
+                extreme_weight_share=("weighted_extreme", "sum"),
+                matched_parts=("PartKey", "nunique"),
+            )
+            .merge(
+                weights[["direct_cost_category", "weight"]],
+                left_on="approved_category",
+                right_on="direct_cost_category",
+                how="inner",
+            )
+        )
+        eligible_basket_weight = float(category_actual["weight"].sum())
+        if eligible_basket_weight <= 0:
+            del category_actual, actual, model, train_pairs, train_daily, weights
+            _release_iteration_memory()
+            continue
+        category_actual["basket_weight"] = (
+            category_actual["weight"] / eligible_basket_weight
+        )
+        actual_composite = float(
+            np.sum(category_actual["basket_weight"] * category_actual["actual_multiplier"])
+        )
+        unannualized_composite = float(
+            np.sum(
+                category_actual["basket_weight"]
+                * category_actual["unannualized_multiplier"]
+            )
+        )
+        effective_gap_days = float(
+            np.sum(
+                category_actual["basket_weight"]
+                * category_actual["effective_gap_days"]
+            )
+        )
+        extreme_weight_share = float(
+            np.sum(
+                category_actual["basket_weight"]
+                * category_actual["extreme_weight_share"]
+            )
+        )
         for method in FORECAST_METHODS:
             forecast = build_forecasts(model, train_pairs, weights, cutoff, config, forced_method=method)
             bucket_map = forecast.bucket_forecast.loc[
@@ -547,8 +634,8 @@ def run_composite_backtest(
             ].set_index("category")["annual_multiplier"].to_dict()
             predicted = float(
                 np.sum(
-                    actual["weight"]
-                    * actual["approved_category"].map(bucket_map).fillna(
+                    category_actual["basket_weight"]
+                    * category_actual["approved_category"].map(bucket_map).fillna(
                         np.exp(np.sum(model.delta0[-12:]))
                     )
                 )
@@ -559,9 +646,11 @@ def run_composite_backtest(
                     "horizon_months": 12,
                     "method": method,
                     "matched_parts": int(len(actual)),
-                    "actual_extreme_weight_share": float(
-                        actual.loc[actual["actual_extreme_flag"], "pre_robust_weight"].sum()
-                    ),
+                    "eligible_basket_weight": eligible_basket_weight,
+                    "actual_effective_gap_days": effective_gap_days,
+                    "stale_parts_excluded": int(actual["stale_parts_excluded"].iloc[0]),
+                    "actual_extreme_weight_share": extreme_weight_share,
+                    "unannualized_actual_multiplier": unannualized_composite,
                     "actual_multiplier": actual_composite,
                     "predicted_multiplier": predicted,
                     "absolute_log_error": abs(np.log(predicted) - np.log(actual_composite)),
@@ -569,7 +658,7 @@ def run_composite_backtest(
                     "signed_error": predicted - actual_composite,
                 }
             )
-        del forecast, model, train_pairs, train_daily, actual, weights
+        del forecast, model, train_pairs, train_daily, actual, category_actual, weights
         _release_iteration_memory()
     detail_df = pd.DataFrame(detail)
     if detail_df.empty:

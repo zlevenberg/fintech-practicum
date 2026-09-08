@@ -120,6 +120,14 @@ Thus weak committed coverage cannot dominate the internal forecast.
 
 Candidate methods are trailing-12-month mean, EWMA, damped Holt, and mean reversion. Rolling-origin backtesting selects using one 12-month fixed-basket composite error per cutoff. Training records, labels, and weights are truncated at every cutoff. Transaction WAPE and forced 0% `last_price` are not selection objectives.
 
+For a matched holdout price observed after an irregular gap of \(d_i\) days, the raw price relative is normalized to the exact backtest horizon \(H\):
+
+$$
+R_i^{(H)}=\exp\left[\log\left(\frac{p_{i,1}}{p_{i,0}}\right)\frac{H}{d_i}\right].
+$$
+
+For the 12-month backtest, \(H\) is the calendar-day distance from cutoff to the 12-month target. Gaps longer than the configured maximum (548 days by default) are excluded as stale rather than mislabeled as one-year inflation. Within each direct-cost bucket, robust part weights produce a bucket actual; the cutoff-only approved basket weights then combine those bucket results. This keeps both the forecast and the scored actual on the same horizon and basket definition.
+
 Holdout price relatives are treated with the same robust policy as training evidence: log relatives are winsorized at the configured tails, bounded by the configured extreme-ratio guardrails, spend weights are capped, and flagged extreme observations retain one-quarter weight. The raw extreme-weight share is reported for every cutoff.
 
 Later years revert toward long run:
