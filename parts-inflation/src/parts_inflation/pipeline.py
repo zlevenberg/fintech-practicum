@@ -85,7 +85,7 @@ def init_config(input_dir: Path, output: Path) -> Path:
     return write_config_workbook(output, scope_mapping=mapping)
 
 
-def run_pipeline(
+def _run_pipeline_legacy(
     input_dir: Path,
     config_path: Path,
     output_dir: Path,
@@ -928,3 +928,34 @@ def run_pipeline(
     write_results_workbook(out_path, payload)
     logger.info("Pipeline complete in %.1fs -> %s", time.time() - t0, out_path)
     return out_path
+
+
+def run_pipeline(
+    input_dir: Path,
+    config_path: Path,
+    output_dir: Path,
+    target_date: Optional[str] = None,
+    base_date: Optional[str] = None,
+    scope_mode: Optional[str] = None,
+    fast_mode: Optional[bool] = None,
+    no_cache: bool = False,
+    rebuild_cache: bool = False,
+    skip_backtest: bool = False,
+    cli_overrides: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Run the v2 direct-cost pipeline; the former implementation is private."""
+    from parts_inflation.v2_pipeline import run_v2_pipeline
+
+    return run_v2_pipeline(
+        input_dir=input_dir,
+        config_path=config_path,
+        output_dir=output_dir,
+        target_date=target_date,
+        base_date=base_date,
+        scope_mode=scope_mode,
+        fast_mode=fast_mode,
+        no_cache=no_cache,
+        rebuild_cache=rebuild_cache,
+        skip_backtest=skip_backtest,
+        cli_overrides=cli_overrides,
+    )

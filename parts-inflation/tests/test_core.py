@@ -50,8 +50,9 @@ def test_part_key_normalization():
 def test_scope_mapping_and_override_precedence(cfg):
     d, cat, reason = classify_scope_row("1210AC", "Inventory")
     assert d == "Include"
-    d2, _, _ = classify_scope_row("4100AC", "COST OF SALES - OUTSIDE SERVICES")
-    assert d2 == "Exclude"
+    d2, cat2, _ = classify_scope_row("4100AC", "COST OF SALES - OUTSIDE SERVICES")
+    assert d2 == "Include"
+    assert cat2 == "COS"
     d3, _, _ = classify_scope_row("1131GC", "Unsure - Include")
     assert d3 == "Needs Review"
 
@@ -88,10 +89,12 @@ def test_open_order_handling(cfg):
     )
     cleaned = clean_po_lines(raw, cfg)
     assert cleaned.loc[0, "is_open_order"]
-    assert cleaned.loc[0, "usable_price_obs"]
-    cfg.controls.include_open_orders_as_prices = False
+    assert not cleaned.loc[0, "usable_price_obs"]
+    assert cleaned.loc[0, "committed_unit_price"] == pytest.approx(10.0)
+    assert cleaned.loc[1, "historical_unit_price"] == pytest.approx(11.0)
+    cfg.controls.include_open_orders_as_prices = True
     cleaned2 = clean_po_lines(raw, cfg)
-    assert not cleaned2.loc[0, "usable_price_obs"]
+    assert cleaned2.loc[0, "usable_price_obs"]
 
 
 def test_same_day_aggregation(cfg):

@@ -25,7 +25,8 @@ def aggregate_same_day(df: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame
     mode = config.controls.same_day_price_aggregation
 
     use["_pq"] = use["price"] * use["qty"]
-    use["_spend"] = use["po_value"].fillna(use["_pq"])
+    realized_spend = use.get("realized_spend", pd.Series(np.nan, index=use.index))
+    use["_spend"] = realized_spend.where(realized_spend > 0, use["_pq"])
     valid_q = use["qty"].notna() & (use["qty"] > 0) & use["price"].notna() & (use["price"] > 0)
     use["_pq_valid"] = np.where(valid_q, use["_pq"], 0.0)
     use["_q_valid"] = np.where(valid_q, use["qty"], 0.0)
@@ -50,6 +51,7 @@ def aggregate_same_day(df: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame
         .groupby(["PartKey", "po_date"], sort=False)
         .agg(
             approved_category=("approved_category", "first"),
+            match_tier=("match_tier", "first"),
             **{
                 "Description 1": ("Description 1", "first"),
                 "Description 2": ("Description 2", "first"),
@@ -94,6 +96,7 @@ def aggregate_same_day(df: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame
         "price_max",
         "agg_method",
         "approved_category",
+        "match_tier",
         "Description 1",
         "Description 2",
         "is_open_order_any",

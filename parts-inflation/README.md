@@ -1,174 +1,149 @@
-# Parts Inflation Prototype
+# Glenair Direct-Cost Inflation
 
-Client-specific parts inflation estimation and forecasting from historical purchase-order data.
+Version 2 calculates three deliberately separate measures from purchase-order history:
 
-Public CPI-style metrics often miss what a manufacturer actually pays for components. This prototype measures **repeat-purchase price change** for the same part numbers, separates quantity effects where possible, and produces part / category / composite forecasts with P10–P90 ranges—without requiring Microsoft Excel to be installed to run the model.
+1. **Historical realized inflation** from received purchases.
+2. **Current committed-cost pressure** from open PO quantities compared with prior realized prices.
+3. **Projected 1-, 2-, and 3-year escalation** for a fixed direct-cost basket.
+
+The official scope is the six client-approved buckets: COS, Inventory, Operating Supplies, Production Supplies, Production Aids, and Small Tooling. Machinery, office supplies, R&D/testing, repairs, freight, and other indirect categories are excluded from the headline.
+
+The four supplied workbooks remain immutable inputs in `data/raw/`. Each run creates a timestamped directory in `outputs/` containing an Excel report, CSV audit tables, JSON configuration/summary files, SHA-256 hashes, and a run manifest.
 
 ## Requirements
 
-- Python **3.11+** (3.12 recommended)
-- macOS or Windows
-- The four PO history workbooks in `data/raw/` (`.xlsx` / `.xlsm`)
+- Python 3.11 or newer
+- Windows 10/11 or macOS
+- The four `.xlsx`/`.xlsm` PO workbooks in `data/raw/`
+- No local Microsoft Excel installation is required
 
-## Quick start (macOS / Linux)
+## Run on macOS
 
 ```bash
 cd parts-inflation
 chmod +x setup_mac.sh run_mac.command
 ./setup_mac.sh
 source .venv/bin/activate
-python -m parts_inflation.cli run \
-  --input-dir data/raw \
-  --config config/model_config.xlsx \
-  --output-dir outputs \
-  --target-date 2027-07-09
+python -m parts_inflation.cli validate
+python -m parts_inflation.cli run
 ```
 
-Or double-click `run_mac.command` after setup.
+After setup, `run_mac.command` can also be opened from Finder.
 
-## Quick start (Windows)
+## Run on Windows
 
 ```bat
 cd parts-inflation
 setup_windows.bat
 .venv\Scripts\activate
-python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
+python -m parts_inflation.cli validate
+python -m parts_inflation.cli run
 ```
 
-Or double-click `run_windows.bat` after setup.
+After setup, `run_windows.bat` can also be double-clicked. The launchers resolve paths relative to the repository, and the package uses `pathlib` for platform-independent paths.
 
-## CLI commands
+## Main commands
 
 ```bash
-python -m parts_inflation.cli init-config --input-dir data/raw --output config/model_config.xlsx
-python -m parts_inflation.cli profile --input-dir data/raw
-python -m parts_inflation.cli validate --input-dir data/raw --config config/model_config.xlsx
-python -m parts_inflation.cli backtest --input-dir data/raw --config config/model_config.xlsx
-python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
-python -m parts_inflation.cli historical-actuals --input-dir data/raw --config config/model_config.xlsx --output-dir outputs
+# Verify inputs and scope without estimating forecasts
+python -m parts_inflation.cli validate
+
+# Official v2 run
+python -m parts_inflation.cli run
+
+# Faster development run; same estimator and convergence standard
+python -m parts_inflation.cli run --fast-mode
+
+# Small deterministic smoke run
+python -m parts_inflation.cli run --fast-mode --skip-backtest --bootstrap-iterations 2
+
+# Earlier forecast origin; all learning is truncated at this date
+python -m parts_inflation.cli run --base-date 2025-09-30
+
+# Unofficial comparable-part candidates for client review
+python -m parts_inflation.cli propose-mappings
 ```
 
-### Historical Actual Inflation
+Explicit CLI flags take precedence over workbook controls, then code defaults. V2 invariants—direct-cost headline scope, realized-only history, open orders excluded from realized weights, and 12/24/36-month horizons—cannot be weakened by legacy settings in an older workbook.
 
-Distinct from the forward forecast. Reproduces spend-weighted and typical-part historical rates via Robust Capped Törnqvist and an independent Huber repeat-purchase regression.
+## Method in brief
 
-```bash
-# macOS / Linux
-python -m parts_inflation.cli historical-actuals \
-  --input-dir data/raw \
-  --config config/model_config.xlsx \
-  --output-dir outputs
+For consecutive observed purchases of the same exact or client-approved comparison entity:
 
-# Or double-click run_historical_actuals_mac.command after setup
-
-# Windows
-python -m parts_inflation.cli historical-actuals --input-dir data\raw --config config\model_config.xlsx --output-dir outputs
-# Or double-click run_historical_actuals_windows.bat
+```text
+y_j = ln(p_j,2 / p_j,1)
+y_j = sum_m D_jm * delta_m + gamma * ln(q_j,2 / q_j,1) + epsilon_j
 ```
 
-Useful flags:
+`D_jm` is the fraction of month `m` crossed by pair `j`. This interval design prevents a multi-month change from being assigned wholly to its endpoint. Estimation uses Huber IRLS, capped spend weights, smoothness/ridge penalties, and downweights extreme pairs without deleting an entire part history.
 
-| Flag | Purpose |
-|---|---|
-| `--scope` | Headline emphasis: `physical_inputs` (default) \| `inventory_only` \| `all_po_lines` (all three are always calculated) |
-| `--winsor-lower` / `--winsor-upper` | Log-relative winsorization quantiles (default 0.01 / 0.99) |
-| `--weight-cap-quantile` | Cap for Törnqvist / regression spend shares (default 0.95) |
-| `--min-pair-gap-days` | Minimum adjacent-pair gap for regression (default 30) |
-| `--include-open-orders` | `true` \| `false` |
-| `--fast` / `--no-cache` | Development / cache control |
+Overall and bucket paths are fitted separately, which identifies the model. Sparse buckets shrink toward overall. Part-specific perpetual trends are disabled by default.
 
-Outputs:
+Annual bucket forecasts also have configurable publication guardrails (default −25% to +50%); every application is flagged in the forecast audit.
 
-- `outputs/historical_actual_inflation_YYYY-MM-DD_HHMMSS.xlsx` — Executive Summary, Scope / Category / Method Sensitivity, Regression, Matched Part Detail, Spend Reconciliation, Data Quality, Methodology, Run Information
-- `outputs/historical_scope_results.csv` (and category / method / regression / matched-part CSVs)
-- `outputs/historical_actual_inflation_summary.md`
+The projected composite is a fixed-basket index:
 
-**Physical-input scope (exact normalized Description):** Inventory, Production Supplies, Operating Supplies, Production Aids, Small Tools. Weights use `PO Value` (not Cost×Qty Ordered). FY2026 is an aligned YTD comparison through July 9 and is not chained after FY2025.
-
-Principal validation targets from the supplied workbooks (calculated, not hard-coded): ~7.7–7.9% annual spend-weighted inflation through FY2025; ~3% typical-part; ~3.0% aligned FY2026 YTD.
-
-Useful flags on `run`:
-
-| Flag | Purpose |
-|---|---|
-| `--fast-mode` | Fewer bootstrap iterations / lighter backtests for development |
-| `--no-cache` / `--rebuild-cache` | Bypass or rebuild Parquet caches |
-| `--skip-backtest` | Skip rolling backtests (still produces forecasts) |
-| `--scope-mode` | `inventory_only` \| `physical_inputs` \| `all_po_lines` |
-| `--base-date` / `--target-date` | Override config dates (`YYYY-MM-DD`) |
-| `--bootstrap-iterations` | Override uncertainty iterations |
-
-**Precedence:** explicit CLI flag → `model_config.xlsx` → code default.
-
-## Configuration workbook
-
-`config/model_config.xlsx` is created automatically on first run (or via `init-config`). It is **not** overwritten by results generation.
-
-Sheets:
-
-- **Controls** — scope, dates, weighting, winsorization, shrinkage, bootstrap, etc.
-- **Scope Mapping** — Bucket/Description → Include / Exclude / Needs Review (Manual Override always wins)
-- **Category Mapping** — optional physical-input category overrides
-- **Part Overrides** — include/exclude, replacement keys, UoM factors, manual prices/qty
-- **Planned Basket** — optional future quantity weights (else trailing-12m `PO Value`)
-
-Default scope is `physical_inputs`. `Needs Review` rows are excluded from that model but quantified in **Scope Sensitivity**.
-
-## Adding another annual workbook
-
-1. Copy the new `.xlsx` or `.xlsm` into `data/raw/` (any filename).
-2. Ensure it has the expected columns (or a sheet containing them; `Sheet2` is preferred).
-3. Optionally refresh scope mapping: `python -m parts_inflation.cli init-config ...` if new Bucket/Description pairs appeared (or edit Scope Mapping manually).
-4. Rebuild cache and rerun:
-
-```bash
-python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --rebuild-cache
+```text
+M(T0,T) = sum_i q_i* p_i(T) / sum_i q_i* p_i(T0)
 ```
 
-Raw files are never modified. Macros in `.xlsm` are not executed.
+The `Planned Basket` sheet can define `q_i*`; otherwise the latest complete fiscal year's realized spend is the documented proxy. Annual composite multipliers are weighted arithmetic means of bucket price multipliers, not averages of rates.
 
-## Outputs
+Forecast methods are selected by rolling-origin fixed-basket composite error. Each cutoff contributes one error per method, future records cannot affect its training/mapping/weights, and `last_price = 0% inflation` is not eligible. Uncertainty uses comparison-entity cluster bootstrap with full refitting.
 
-Each `run` writes:
+See [Methodology](docs/METHODOLOGY.md) for full equations, controls, acceptance rules, and limitations.
 
-- `outputs/parts_inflation_results_YYYY-MM-DD_HHMMSS.xlsx` — Dashboard, Controls Used, Scope Sensitivity, Historical Index, Category Results, Part Forecasts, Backtests, Scope Mapping, Data Quality, Methodology, Run Information
-- `outputs/logs/parts_inflation_*.log`
+## Price fields and timing
 
-Each `historical-actuals` run writes the historical workbook / CSV / Markdown files listed above (separate from forecast outputs).
+| Measure | Primary price | Weight/value | Timing |
+|---|---|---|---|
+| Realized history | `Extension (Qty Received) / Qty Received` | Received extension | Receipt date, else PO-date proxy |
+| Committed signal | `PO Value / Qty Ordered` | Remaining open quantity × committed unit price | PO date |
+| Forecast | Modeled bucket multiplier | Fixed planned or latest-complete-FY basket | 1/2/3 years from base date |
+
+`Cost` is only a documented fallback because the source may contain per-100 or per-1,000 price bases. Reconciliation ratios and likely power-of-ten factors are reported. Client-approved `UoMAdjustmentFactor` values update price and quantity inversely while preserving spend.
+
+## Output package
+
+Every successful run writes `outputs/v2_<UTC timestamp>/` with:
+
+- `inflation_report.xlsx`: executive summary, historical FY/TTM/monthly series, forecasts, committed costs, coverage, backtests, data quality, exclusions, mapping candidates, benchmarks, methodology, and run information.
+- Historical, forecast, backtest, coverage, data-quality, exclusion, pair-audit, committed-cost, and mapping-candidate CSVs.
+- `summary.json`, `resolved_config.json`, and `run_manifest.json`.
+
+The run fails without an official workbook if the main estimator does not converge, fewer than 50 valid pairs exist, a source file changes mid-run, or required report sheets cannot be reopened after writing.
+
+## Configuration
+
+`config/model_config.xlsx` contains Controls, Scope Mapping, Category Mapping, Part Overrides, and Planned Basket sheets. Only exact normalized part keys and explicit `ReplacementPartKey` mappings affect official matches. `propose-mappings` creates candidates for review but never activates them automatically.
 
 ## Tests
 
 ```bash
-source .venv/bin/activate
-pytest -q
-# Include smoke / historical integration against real workbooks:
-pytest -q -m integration
+python -m pytest -q -m "not integration"
+python -m pytest -q -m integration
+python -m pytest -q
 ```
 
-## Honest limitations
+Tests cover scope, price separation, benchmark chronology, interval exposure, UOM overrides, cutoff leakage, fixed-basket arithmetic, forecasting, report reopening, and retained legacy utilities.
 
-- Roughly four years of history; FY2026 is incomplete (historical YTD aligned through July 9).
-- Supplier, currency, unit of measure, PO number, contract status, and facility are unavailable—so apparent price changes may include supplier switches, spec changes, currency, contracts, emergency buys, or UoM changes.
-- Most distinct parts are not observed across multiple fiscal years; matched spend coverage for physical inputs is typically ~45–58% in headline comparisons.
-- `PO Value` and `Cost × Qty Ordered` disagree materially in aggregate; historical weights always use `PO Value`.
-- Spend-weighted rates describe client cost exposure; unweighted rates describe the typical matched part—they are not the same.
-- Historical actual inflation is not automatically the best forward forecast; the two analyses remain distinct.
-- Horizons beyond 24 months are **scenarios** with widening uncertainty, not precise forecasts.
-- A client-approved scope/category map and planned basket would improve forecast results materially.
-- Architecture is modular so older years and richer fields can be added without a rewrite.
+## Known data limitations
 
-## Project layout
+- Receipt date is absent, so PO date is a proxy for realized timing.
+- Vendor ID is absent, so vendor-level inflation, supplier switching, and concentration cannot yet be measured despite the client's thousands of vendors.
+- Currency, UOM/price basis, PO number/line, facility, order status, and contract flags are absent.
+- Duplicate-looking rows are flagged and preserved because no PO-line key proves duplication.
+- Sparse or low-coverage buckets are disclosed and shrink toward overall.
+- A planned BOM/MRP basket is preferable to the latest-complete-FY spend proxy.
+- Forecasts beyond 24 months are scenarios, not precise point predictions.
 
-```text
-parts-inflation/
-├── data/raw/          # place PO workbooks here
-├── data/cache/        # Parquet caches (safe to delete)
-├── config/            # model_config.xlsx
-├── src/parts_inflation/
-├── tests/
-├── outputs/
-├── run_mac.command / run_windows.bat
-├── run_historical_actuals_mac.command / run_historical_actuals_windows.bat
-├── requirements.txt
-└── README.md
-```
+These limitations are surfaced in every report rather than silently filled with assumptions.
+
+## Add another annual workbook
+
+1. Copy it into `data/raw/`.
+2. Run `python -m parts_inflation.cli validate`.
+3. Review new category, part, and UOM mappings in `model_config.xlsx`.
+4. Run `python -m parts_inflation.cli run`.
+
+Raw workbooks and macros are never modified or executed.

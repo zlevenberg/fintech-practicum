@@ -33,6 +33,7 @@ REQUIRED_SOURCE_COLUMNS = [
 
 
 class ScopeMode(str, Enum):
+    direct_costs = "direct_costs"
     inventory_only = "inventory_only"
     physical_inputs = "physical_inputs"
     all_po_lines = "all_po_lines"
@@ -71,15 +72,15 @@ class SelectedModelMode(str, Enum):
 
 
 class ControlDefaults(BaseModel):
-    scope_mode: ScopeMode = ScopeMode.physical_inputs
+    scope_mode: ScopeMode = ScopeMode.direct_costs
     base_date: Optional[date] = None
     target_date: Optional[date] = None
     composite_weighting: CompositeWeighting = CompositeWeighting.trailing_12m_po_value
     price_field: str = "Cost"
     quantity_field: str = "Qty Ordered"
     spend_field: str = "PO Value"
-    include_open_orders_as_prices: bool = True
-    include_open_orders_in_weights: bool = True
+    include_open_orders_as_prices: bool = False
+    include_open_orders_in_weights: bool = False
     same_day_price_aggregation: SameDayAgg = SameDayAgg.quantity_weighted_mean
     quantity_adjustment_mode: QuantityAdjustmentMode = QuantityAdjustmentMode.estimate
     quantity_fallback_to_received: bool = False
@@ -90,7 +91,7 @@ class ControlDefaults(BaseModel):
     part_min_span_days: int = 365
     category_min_pairs: int = 100
     part_shrinkage_k: float = 5.0
-    forecast_horizons_months: str = "3,6,12"
+    forecast_horizons_months: str = "12,24,36"
     bootstrap_iterations: int = 100
     random_seed: int = 42
     confidence_lower_quantile: float = 0.10
@@ -110,6 +111,16 @@ class ControlDefaults(BaseModel):
     lambda_gamma: float = 2.0
     huber_delta: float = 1.5
     cache_enabled: bool = True
+    fail_on_nonconvergence: bool = True
+    allow_part_specific_trends: bool = False
+    minimum_matched_spend_coverage: float = 0.20
+    committed_full_weight_coverage: float = 0.50
+    committed_overlay_max_weight: float = 0.60
+    forecast_mean_reversion_rho: float = 0.50
+    forecast_annual_log_floor: float = -0.2876820724517809  # log(0.75)
+    forecast_annual_log_cap: float = 0.4054651081081644  # log(1.50)
+    fiscal_year_end_month: int = 9
+    fiscal_year_end_day: int = 30
     # Historical actuals (optional; CLI flags override)
     historical_winsor_lower: float = 0.01
     historical_winsor_upper: float = 0.99
@@ -122,6 +133,8 @@ class ControlDefaults(BaseModel):
         "quantity_fallback_to_received",
         "fast_mode",
         "cache_enabled",
+        "fail_on_nonconvergence",
+        "allow_part_specific_trends",
         mode="before",
     )
     @classmethod
@@ -155,7 +168,7 @@ class ControlDefaults(BaseModel):
 
 
 CONTROL_DESCRIPTIONS: dict[str, str] = {
-    "scope_mode": "Analysis scope: inventory_only | physical_inputs | all_po_lines",
+    "scope_mode": "Analysis scope: direct_costs | inventory_only | physical_inputs (legacy alias) | all_po_lines",
     "base_date": "Model base date T0 (blank = latest valid PO date)",
     "target_date": "Forecast target date (blank = base_date + 12 months)",
     "composite_weighting": "Composite basket weights: trailing_12m_po_value | planned_basket",
@@ -194,6 +207,16 @@ CONTROL_DESCRIPTIONS: dict[str, str] = {
     "lambda_gamma": "Ridge penalty on category quantity-elasticity deviations",
     "huber_delta": "Huber loss threshold in residual sigma units",
     "cache_enabled": "Use Parquet cache for cleaned data and pairs",
+    "fail_on_nonconvergence": "Block official outputs when the selected model does not converge",
+    "allow_part_specific_trends": "Experimental only; default FALSE so forecasts fall back to approved bucket rates",
+    "minimum_matched_spend_coverage": "Coverage threshold below which headline results are warned/suppressed",
+    "committed_full_weight_coverage": "Matched open-value coverage that earns full configured overlay weight",
+    "committed_overlay_max_weight": "Maximum year-1 forecast weight assigned to the committed-cost signal",
+    "forecast_mean_reversion_rho": "Persistence of year-1 deviation from long-run bucket inflation in years 2-3",
+    "forecast_annual_log_floor": "Hard annual forecast floor in log units (default log(0.75))",
+    "forecast_annual_log_cap": "Hard annual forecast cap in log units (default log(1.50))",
+    "fiscal_year_end_month": "Fiscal-year end month (Glenair default 9)",
+    "fiscal_year_end_day": "Fiscal-year end day (Glenair default 30)",
     "historical_winsor_lower": "Historical actuals: lower quantile for log-relative winsorization",
     "historical_winsor_upper": "Historical actuals: upper quantile for log-relative winsorization",
     "historical_weight_cap_quantile": "Historical actuals: share/weight cap quantile (default 0.95)",
@@ -235,20 +258,35 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-# Heuristic include/exclude keywords for Scope Mapping
-INCLUDE_KEYWORDS = [
-    "inventory",
-    "production supplies",
-    "operating supplies",
-    "production aids",
-    "small tools",
-    "office supplies",
-    "machinery",
-    "furnishings",
-    "product testing",
-]
+# Client-approved direct-cost categories. Raw descriptions are normalized before
+# matching; the two COST OF SALES descriptions roll into the conceptual COS bucket.
+DIRECT_COST_CATEGORY_ALIASES = {
+    "COS": "COS",
+    "INVENTORY": "Inventory",
+    "OPERATING SUPPLIES": "Operating Supplies",
+    "PRODUCTION SUPPLIES": "Production Supplies",
+    "PRODUCTION AIDS": "Production Aids",
+    "SMALL TOOLS": "Small Tooling",
+    "SMALL TOOLING": "Small Tooling",
+}
+
+
+def normalize_category_text(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return " ".join(str(value).strip().upper().split())
+
+
+def direct_cost_category(description: Any) -> Optional[str]:
+    """Map a raw Description to one of the six client-approved direct-cost buckets."""
+    desc = normalize_category_text(description)
+    if desc.startswith("COST OF SALES"):
+        return "COS"
+    return DIRECT_COST_CATEGORY_ALIASES.get(desc)
+
+
+# Heuristic exclusions apply only after checking the explicit client-approved scope.
 EXCLUDE_KEYWORDS = [
-    "outside services",
     "labor",
     "shipping",
     "freight",
@@ -265,11 +303,14 @@ NEEDS_REVIEW_KEYWORDS = [
 
 
 def classify_scope_row(bucket: Any, description: Any) -> tuple[str, str, str]:
-    """Return (default_decision, physical_input_category, reason)."""
+    """Return (default_decision, direct_cost_category, reason)."""
     desc = "" if description is None or (isinstance(description, float) and pd.isna(description)) else str(description)
     bucket_s = "" if bucket is None or (isinstance(bucket, float) and pd.isna(bucket)) else str(bucket)
     text = f"{bucket_s} {desc}".lower()
-    cat = desc.strip() if desc.strip() else "Uncategorized"
+    approved = direct_cost_category(desc)
+    if approved is not None:
+        return "Include", approved, "Client-approved direct-cost category"
+    cat = normalize_category_text(desc).title() if desc.strip() else "Uncategorized"
 
     for kw in EXCLUDE_KEYWORDS:
         if kw in text:
@@ -277,9 +318,6 @@ def classify_scope_row(bucket: Any, description: Any) -> tuple[str, str, str]:
     for kw in NEEDS_REVIEW_KEYWORDS:
         if kw in text:
             return "Needs Review", cat, f"Ambiguous category keyword: {kw}"
-    for kw in INCLUDE_KEYWORDS:
-        if kw in text:
-            return "Include", cat, f"Matched include keyword: {kw}"
     return "Needs Review", cat, "No strong include/exclude keyword; marked Needs Review"
 
 

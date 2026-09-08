@@ -11,6 +11,7 @@ import pandas as pd
 from parts_inflation.config import (
     ResolvedConfig,
     ScopeMode,
+    direct_cost_category,
     invent_initial_scope_mapping,
 )
 
@@ -118,6 +119,8 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
     df["Resolved Decision"] = df["Resolved Decision"].fillna("Needs Review")
     df["Physical Input Category"] = df["Physical Input Category"].fillna("Uncategorized")
     df["scope_uncertain"] = df["Resolved Decision"].eq("Needs Review")
+    df["direct_cost_category"] = df["Description"].map(direct_cost_category)
+    df["in_direct_costs"] = df["direct_cost_category"].notna()
 
     # Part overrides
     overrides = config.part_overrides
@@ -135,6 +138,11 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
                 df["Category"].astype(str).str.lower() != "nan"
             )
             df.loc[use_cat, "Physical Input Category"] = df.loc[use_cat, "Category"]
+            approved_override = df.loc[use_cat, "Category"].map(direct_cost_category)
+            direct_override = approved_override.notna()
+            direct_idx = approved_override.index[direct_override]
+            df.loc[direct_idx, "direct_cost_category"] = approved_override.loc[direct_idx]
+            df.loc[direct_idx, "in_direct_costs"] = True
         if "ReplacementPartKey" in df.columns:
             use_rep = df["ReplacementPartKey"].notna() & (
                 df["ReplacementPartKey"].astype(str).str.strip() != ""
@@ -142,11 +150,18 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
             df.loc[use_rep, "PartKey"] = (
                 df.loc[use_rep, "ReplacementPartKey"].astype(str).str.strip().str.upper()
             )
+            df["comparison_entity_id"] = df["PartKey"]
+            df["match_tier"] = np.where(use_rep, "client_approved", "exact")
         if "UoMAdjustmentFactor" in df.columns:
             factor = pd.to_numeric(df["UoMAdjustmentFactor"], errors="coerce")
             adj = factor.notna() & (factor > 0)
-            df.loc[adj, "price"] = df.loc[adj, "price"] / factor[adj]
-            df.loc[adj, "qty"] = df.loc[adj, "qty"] * factor[adj]
+            for price_col in ["price", "historical_unit_price", "committed_unit_price"]:
+                if price_col in df.columns:
+                    df.loc[adj, price_col] = df.loc[adj, price_col] / factor[adj]
+            for qty_col in ["qty", "qty_ordered", "qty_received", "remaining_open_qty"]:
+                if qty_col in df.columns:
+                    df.loc[adj, qty_col] = df.loc[adj, qty_col] * factor[adj]
+            df["uom_adjustment_applied"] = adj
         # Part-level price/qty overrides are carried forward; applied at forecast time
         # so historical pair estimation is not rewritten.
         if "ManualCurrentPrice" in df.columns:
@@ -168,31 +183,37 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
         df["manual_future_quantity"] = np.nan
         df["price_override_reason"] = ""
 
+    if "comparison_entity_id" not in df.columns:
+        df["comparison_entity_id"] = df["PartKey"]
+    if "match_tier" not in df.columns:
+        df["match_tier"] = "exact"
+
     # Service-like descriptions should not be treated as physical merely due to part key
     labor_mask = df["service_like_description"].fillna(False) & df["Resolved Decision"].eq("Include")
     df.loc[labor_mask, "scope_warning"] = "service_like_description"
     # For physical_inputs, demote labor-like includes to Needs Review unless manually overridden
     manual = df.get("Manual Override", pd.Series("", index=df.index)).astype(str).str.strip()
-    demote = labor_mask & manual.eq("")
+    demote = labor_mask & manual.eq("") & ~df["in_direct_costs"]
     df.loc[demote, "Resolved Decision"] = "Needs Review"
     df.loc[demote, "scope_uncertain"] = True
 
     scope_mode = config.controls.scope_mode
 
-    def in_scope(decision: str, category: str) -> bool:
+    def in_scope(decision: str, category: str, direct: bool) -> bool:
         if scope_mode == ScopeMode.all_po_lines:
             return decision != "Exclude"  # still flag services but include usable prices
-        if decision == "Exclude":
-            return False
-        if decision == "Needs Review":
-            return False  # excluded by default for inventory/physical; quantified separately
         if scope_mode == ScopeMode.inventory_only:
-            return str(category).strip().lower() == "inventory"
-        # physical_inputs
-        return decision == "Include"
+            return direct and str(category).strip().lower() == "inventory"
+        # direct_costs is the v2 default; physical_inputs is retained as a legacy alias.
+        if scope_mode in {ScopeMode.direct_costs, ScopeMode.physical_inputs}:
+            return direct
+        return False
 
     df["in_selected_scope"] = [
-        in_scope(d, c) for d, c in zip(df["Resolved Decision"], df["Physical Input Category"])
+        in_scope(d, c, direct)
+        for d, c, direct in zip(
+            df["Resolved Decision"], df["direct_cost_category"], df["in_direct_costs"]
+        )
     ]
     df["model_eligible"] = df["included_for_pricing"] & df["in_selected_scope"]
     # Parts with a manual current price remain eligible even without an observed price row
@@ -206,36 +227,40 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
     # Sensitivity scopes
     df["in_inventory_only"] = (
         df["included_for_pricing"]
-        & df["Resolved Decision"].eq("Include")
-        & df["Physical Input Category"].astype(str).str.strip().str.lower().eq("inventory")
+        & df["direct_cost_category"].astype(str).str.strip().str.lower().eq("inventory")
     )
-    df["in_physical_inputs"] = df["included_for_pricing"] & df["Resolved Decision"].eq("Include")
+    df["in_physical_inputs"] = df["included_for_pricing"] & df["in_direct_costs"]
     df["in_all_po_lines"] = df["included_for_pricing"]
     df["in_physical_plus_needs_review"] = df["included_for_pricing"] & df["Resolved Decision"].isin(
         ["Include", "Needs Review"]
     )
 
     # Modal category per part
-    eligible = df.loc[df["PartKey"].notna() & df["Physical Input Category"].notna()]
+    eligible = df.loc[
+        df["PartKey"].notna()
+        & df["in_direct_costs"]
+        & df["included_for_pricing"]
+        & df["direct_cost_category"].notna()
+    ]
     if not eligible.empty:
         modal = (
-            eligible.groupby(["PartKey", "Physical Input Category"])
+            eligible.groupby(["PartKey", "direct_cost_category"])
             .size()
             .reset_index(name="n")
             .sort_values(["PartKey", "n"], ascending=[True, False])
             .drop_duplicates("PartKey")
-            .rename(columns={"Physical Input Category": "modal_category"})
+            .rename(columns={"direct_cost_category": "modal_category"})
         )
         df = df.merge(modal[["PartKey", "modal_category"]], on="PartKey", how="left")
         # Incompatible category flag
-        n_cats = eligible.groupby("PartKey")["Physical Input Category"].nunique()
+        n_cats = eligible.groupby("PartKey")["direct_cost_category"].nunique()
         multi = set(n_cats[n_cats > 1].index)
         df["incompatible_categories"] = df["PartKey"].isin(multi)
-        df["approved_category"] = df["modal_category"].fillna(df["Physical Input Category"])
+        df["approved_category"] = df["modal_category"].fillna(df["direct_cost_category"])
     else:
-        df["modal_category"] = df["Physical Input Category"]
+        df["modal_category"] = df["direct_cost_category"]
         df["incompatible_categories"] = False
-        df["approved_category"] = df["Physical Input Category"]
+        df["approved_category"] = df["direct_cost_category"]
 
     logger.info(
         "Scope %s: model_eligible=%s / pricing=%s",
@@ -244,3 +269,33 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
         int(df["included_for_pricing"].sum()),
     )
     return df, mapping
+
+
+def apply_cutoff_category_labels(df: pd.DataFrame, base_date: pd.Timestamp) -> pd.DataFrame:
+    """Assign modal comparison-entity categories using data known by the cutoff only."""
+    out = df.copy()
+    cutoff = pd.Timestamp(base_date)
+    known = out.loc[
+        out["comparison_entity_id"].notna()
+        & out["in_direct_costs"].fillna(False)
+        & pd.to_datetime(out["effective_historical_date"]).le(cutoff)
+        & out["direct_cost_category"].notna()
+    ]
+    if known.empty:
+        out["approved_category"] = out["direct_cost_category"]
+        return out
+    modal = (
+        known.groupby(["comparison_entity_id", "direct_cost_category"])
+        .size()
+        .reset_index(name="n")
+        .sort_values(
+            ["comparison_entity_id", "n", "direct_cost_category"],
+            ascending=[True, False, True],
+        )
+        .drop_duplicates("comparison_entity_id")
+        .set_index("comparison_entity_id")["direct_cost_category"]
+    )
+    out["approved_category"] = out["comparison_entity_id"].map(modal).fillna(
+        out["direct_cost_category"]
+    )
+    return out

@@ -39,15 +39,20 @@ def assign_period(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
     d = daily.copy()
     d["po_date"] = pd.to_datetime(d["po_date"])
     if freq == "M":
-        d["period"] = d["po_date"].dt.to_period("M").astype(str)
-        d["period_end"] = d["po_date"].dt.to_period("M").dt.to_timestamp("M")
+        per = d["po_date"].dt.to_period("M")
+        d["period"] = per.astype(str)
+        d["period_end"] = per.dt.to_timestamp("M")
+        d["period_ordinal"] = per.map(lambda x: x.ordinal)
     elif freq == "Q":
-        d["period"] = d["po_date"].dt.to_period("Q").astype(str)
-        d["period_end"] = d["po_date"].dt.to_period("Q").dt.to_timestamp("Q")
+        per = d["po_date"].dt.to_period("Q")
+        d["period"] = per.astype(str)
+        d["period_end"] = per.dt.to_timestamp("Q")
+        d["period_ordinal"] = per.map(lambda x: x.ordinal)
     elif freq == "Y":
         fy = np.where(d["po_date"].dt.month >= 10, d["po_date"].dt.year + 1, d["po_date"].dt.year)
         d["period"] = [f"FY{int(y)}" for y in fy]
         d["period_end"] = pd.to_datetime([f"{int(y)}-09-30" for y in fy])
+        d["period_ordinal"] = fy.astype(int)
     else:
         raise ValueError(freq)
     return d
@@ -70,6 +75,7 @@ def period_part_prices(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
         spend=("_spend", "sum"),
         price_median=("price", "median"),
         period_end=("period_end", "first"),
+        period_ordinal=("period_ordinal", "first"),
         approved_category=("approved_category", "first"),
     ).reset_index()
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -94,15 +100,20 @@ def matched_part_log_changes(
     cur["prev_qty"] = g["qty"].shift(1)
     cur["prev_spend"] = g["spend"].shift(1)
     cur["prev_period_end"] = g["period_end"].shift(1)
+    if "period_ordinal" in cur.columns:
+        cur["prev_period_ordinal"] = g["period_ordinal"].shift(1)
     m = cur.dropna(subset=["prev_price", "price"])
     m = m[(m["prev_price"] > 0) & (m["price"] > 0)]
+    if "period_ordinal" in m.columns:
+        m = m.loc[(m["period_ordinal"] - m["prev_period_ordinal"]) == 1]
     if m.empty:
         return pd.DataFrame()
     m["r"] = np.log(m["price"] / m["prev_price"])
     m["matched_spend"] = np.sqrt(m["spend"].fillna(0).clip(lower=0) * m["prev_spend"].fillna(0).clip(lower=0))
 
     results = []
-    for period, grp in m.groupby("period"):
+    total_spend = period_prices.groupby("period")["spend"].sum()
+    for period, grp in m.sort_values("period_end").groupby("period", sort=False):
         r = grp["r"].to_numpy()
         w = grp["matched_spend"].to_numpy()
         if w.sum() <= 0:
@@ -121,6 +132,11 @@ def matched_part_log_changes(
                 "period_end": grp["period_end"].iloc[0],
                 "match_count": len(grp),
                 "matched_spend": float(grp["matched_spend"].sum()),
+                "current_matched_spend": float(grp["spend"].fillna(0).sum()),
+                "current_total_spend": float(total_spend.get(period, np.nan)),
+                "current_spend_coverage": float(
+                    grp["spend"].fillna(0).sum() / total_spend.get(period)
+                ) if total_spend.get(period, 0) > 0 else np.nan,
                 "median_pct_change": float(np.expm1(np.median(r))),
                 "equal_weight_geom": float(np.expm1(ew)),
                 "winsor_equal_weight_geom": float(np.expm1(ew_win)),
@@ -144,14 +160,19 @@ def tornqvist_index(period_prices: pd.DataFrame) -> pd.DataFrame:
     cur["prev_spend"] = g["spend"].shift(1)
     cur["prev_period"] = g["period"].shift(1)
     cur["prev_period_end"] = g["period_end"].shift(1)
+    if "period_ordinal" in cur.columns:
+        cur["prev_period_ordinal"] = g["period_ordinal"].shift(1)
     m = cur.dropna(subset=["prev_price", "price"])
     m = m[(m["prev_price"] > 0) & (m["price"] > 0)]
+    if "period_ordinal" in m.columns:
+        m = m.loc[(m["period_ordinal"] - m["prev_period_ordinal"]) == 1]
     if m.empty:
         return pd.DataFrame()
 
     rows = []
     index_level = 1.0
-    for period, grp in m.groupby("period", sort=False):
+    total_spend = period_prices.groupby("period")["spend"].sum()
+    for period, grp in m.sort_values("period_end").groupby("period", sort=False):
         # Expenditure shares within matched basket
         spend_t = (grp["price"] * grp["qty"].fillna(0)).to_numpy()
         spend_tm1 = (grp["prev_price"] * grp["prev_qty"].fillna(0)).to_numpy()
@@ -189,6 +210,10 @@ def tornqvist_index(period_prices: pd.DataFrame) -> pd.DataFrame:
                 "match_count": len(grp),
                 "matched_spend_t": float(spend_t.sum()),
                 "matched_spend_tm1": float(spend_tm1.sum()),
+                "current_total_spend": float(total_spend.get(period, np.nan)),
+                "current_spend_coverage": float(spend_t.sum() / total_spend.get(period))
+                if total_spend.get(period, 0) > 0
+                else np.nan,
                 "status": "ok",
             }
         )
@@ -205,8 +230,12 @@ def fisher_index(period_prices: pd.DataFrame) -> pd.DataFrame:
     cur["prev_price"] = g["price"].shift(1)
     cur["prev_qty"] = g["qty"].shift(1)
     cur["prev_period_end"] = g["period_end"].shift(1)
+    if "period_ordinal" in cur.columns:
+        cur["prev_period_ordinal"] = g["period_ordinal"].shift(1)
     m = cur.dropna(subset=["prev_price", "price", "prev_qty", "qty"])
     m = m[(m["prev_price"] > 0) & (m["price"] > 0) & (m["prev_qty"] > 0) & (m["qty"] > 0)]
+    if "period_ordinal" in m.columns:
+        m = m.loc[(m["period_ordinal"] - m["prev_period_ordinal"]) == 1]
     if m.empty:
         return pd.DataFrame(
             [{"period": None, "status": "unavailable", "reason": "insufficient valid quantities"}]
@@ -214,7 +243,7 @@ def fisher_index(period_prices: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
     index_level = 1.0
-    for period, grp in m.groupby("period", sort=False):
+    for period, grp in m.sort_values("period_end").groupby("period", sort=False):
         p_t = grp["price"].to_numpy()
         p_0 = grp["prev_price"].to_numpy()
         q_t = grp["qty"].to_numpy()

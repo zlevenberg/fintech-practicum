@@ -14,7 +14,7 @@ from parts_inflation.config import DedupMode, ResolvedConfig
 
 logger = logging.getLogger(__name__)
 
-CLEANING_VERSION = "clean_v1"
+CLEANING_VERSION = "clean_v2_realized_committed"
 
 
 def normalize_part_key(value: Any) -> tuple[Optional[str], bool, str]:
@@ -62,6 +62,21 @@ def _to_float(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    num = pd.to_numeric(numerator, errors="coerce")
+    den = pd.to_numeric(denominator, errors="coerce")
+    return num.div(den.where(den.abs() > 0))
+
+
+def _nearest_basis_factor(ratio: float, tolerance: float = 0.03) -> Optional[float]:
+    """Return a likely power-of-ten price-basis factor, otherwise None."""
+    if not np.isfinite(ratio) or ratio <= 0:
+        return None
+    candidates = np.array([0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0])
+    nearest = float(candidates[np.argmin(np.abs(np.log(ratio / candidates)))])
+    return nearest if abs(ratio / nearest - 1.0) <= tolerance else None
+
+
 def clean_po_lines(raw: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame:
     """Normalize fields, flag issues, and assign inclusion eligibility."""
     df = raw.copy()
@@ -80,25 +95,77 @@ def clean_po_lines(raw: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame:
 
     # Dates
     df["po_date"] = pd.to_datetime(df["P.O. Date"], errors="coerce")
+    receipt_col = next(
+        (c for c in ["Receipt Date", "Received Date", "P.O. Receipt Date"] if c in df.columns),
+        None,
+    )
+    df["receipt_date"] = (
+        pd.to_datetime(df[receipt_col], errors="coerce") if receipt_col else pd.NaT
+    )
+    df["effective_historical_date"] = df["receipt_date"].fillna(df["po_date"])
+    df["historical_date_proxy"] = df["receipt_date"].isna()
     df["invalid_date"] = df["po_date"].isna() & df["P.O. Date"].notna()
     df["missing_date"] = df["P.O. Date"].isna()
 
     # Numerics
-    df["price"] = _to_float(df[ctrls.price_field if ctrls.price_field in df.columns else "Cost"])
+    df["cost_raw"] = _to_float(df[ctrls.price_field if ctrls.price_field in df.columns else "Cost"])
     df["qty_ordered"] = _to_float(df["Qty Ordered"])
     df["qty_received"] = _to_float(df["Qty Received"])
     df["po_value"] = _to_float(df["PO Value"])
     df["extension_received"] = _to_float(df["Extension (Qty Received)"])
 
-    df["qty"] = df["qty_ordered"]
-    df["qty_fallback_used"] = False
-    if ctrls.quantity_fallback_to_received:
-        need = df["qty"].isna() | (df["qty"] <= 0)
-        can = need & df["qty_received"].notna() & (df["qty_received"] > 0)
-        df.loc[can, "qty"] = df.loc[can, "qty_received"]
-        df.loc[can, "qty_fallback_used"] = True
+    df["ordered_unit_price_implied"] = _safe_ratio(df["po_value"], df["qty_ordered"])
+    df["received_unit_price_implied"] = _safe_ratio(
+        df["extension_received"], df["qty_received"]
+    )
 
-    df["calculated_ordered_value"] = df["price"] * df["qty_ordered"]
+    has_received = df["qty_received"].fillna(0).gt(0)
+    valid_received_implied = (
+        has_received
+        & df["received_unit_price_implied"].notna()
+        & np.isfinite(df["received_unit_price_implied"])
+        & df["received_unit_price_implied"].gt(0)
+    )
+    valid_ordered_implied = (
+        df["qty_ordered"].fillna(0).gt(0)
+        & df["ordered_unit_price_implied"].notna()
+        & np.isfinite(df["ordered_unit_price_implied"])
+        & df["ordered_unit_price_implied"].gt(0)
+    )
+    valid_cost = df["cost_raw"].notna() & np.isfinite(df["cost_raw"]) & df["cost_raw"].gt(0)
+
+    df["historical_unit_price"] = np.where(
+        valid_received_implied,
+        df["received_unit_price_implied"],
+        np.where(has_received & valid_cost, df["cost_raw"], np.nan),
+    )
+    df["historical_price_source"] = np.select(
+        [valid_received_implied, has_received & valid_cost],
+        ["received_extension_div_qty", "cost_fallback"],
+        default="unavailable",
+    )
+    df["committed_unit_price"] = np.where(
+        valid_ordered_implied, df["ordered_unit_price_implied"], np.where(valid_cost, df["cost_raw"], np.nan)
+    )
+    df["committed_price_source"] = np.select(
+        [valid_ordered_implied, valid_cost],
+        ["po_value_div_qty", "cost_fallback"],
+        default="unavailable",
+    )
+
+    df["qty_fallback_used"] = False
+    df["qty"] = np.where(has_received, df["qty_received"], df["qty_ordered"])
+
+    df["calculated_ordered_value"] = df["cost_raw"] * df["qty_ordered"]
+    df["calculated_received_value"] = df["cost_raw"] * df["qty_received"]
+    df["po_reconciliation_ratio"] = _safe_ratio(df["po_value"], df["calculated_ordered_value"])
+    df["received_reconciliation_ratio"] = _safe_ratio(
+        df["extension_received"], df["calculated_received_value"]
+    )
+    df["po_likely_basis_factor"] = df["po_reconciliation_ratio"].map(_nearest_basis_factor)
+    df["received_likely_basis_factor"] = df["received_reconciliation_ratio"].map(
+        _nearest_basis_factor
+    )
     df["po_value_matches_ordered"] = (
         df["po_value"].notna()
         & df["calculated_ordered_value"].notna()
@@ -106,17 +173,36 @@ def clean_po_lines(raw: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame:
     )
     df["po_value_matches_received"] = (
         df["po_value"].notna()
-        & df["price"].notna()
+        & df["cost_raw"].notna()
         & df["qty_received"].notna()
-        & np.isclose(df["po_value"], df["price"] * df["qty_received"], rtol=1e-4, atol=0.01)
+        & np.isclose(df["po_value"], df["cost_raw"] * df["qty_received"], rtol=1e-4, atol=0.01)
     )
 
     # Open orders
     df["is_open_order"] = (
         (df["qty_received"].fillna(0) <= 0)
         & (df["qty_ordered"].fillna(0) > 0)
-        & (df["price"].fillna(0) > 0)
+        & (df["committed_unit_price"].fillna(0) > 0)
     )
+    df["is_partially_received"] = (
+        df["qty_received"].fillna(0).gt(0)
+        & df["qty_ordered"].fillna(0).gt(df["qty_received"].fillna(0))
+    )
+    df["remaining_open_qty"] = (
+        df["qty_ordered"].fillna(0) - df["qty_received"].fillna(0)
+    ).clip(lower=0)
+    df["has_open_commitment"] = df["remaining_open_qty"].gt(0) & df["committed_unit_price"].fillna(0).gt(0)
+    df["realized_spend"] = np.where(
+        valid_received_implied,
+        df["extension_received"].clip(lower=0),
+        np.where(has_received, df["historical_unit_price"] * df["qty_received"], 0.0),
+    )
+    df["remaining_open_spend"] = df["remaining_open_qty"] * df["committed_unit_price"]
+
+    # Legacy-compatible generic fields now represent realized history by default.
+    df["price"] = df["historical_unit_price"]
+    open_fallback = df["price"].isna() & df["is_open_order"] & ctrls.include_open_orders_as_prices
+    df.loc[open_fallback, "price"] = df.loc[open_fallback, "committed_unit_price"]
 
     # Valid price observation
     df["valid_price"] = df["price"].notna() & np.isfinite(df["price"]) & (df["price"] > 0)
@@ -135,7 +221,7 @@ def clean_po_lines(raw: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame:
     fingerprint_cols = [
         "po_date",
         "PartKey",
-        "price",
+        "cost_raw",
         "qty_ordered",
         "qty_received",
         "po_value",
@@ -175,7 +261,11 @@ def clean_po_lines(raw: pd.DataFrame, config: ResolvedConfig) -> pd.DataFrame:
 
     df["included_for_pricing"] = df["usable_price_obs"] & (df["exclusion_reason"] == "")
     # Weight eligibility
-    df["included_for_weights"] = df["included_for_pricing"] & df["po_value"].notna() & (df["po_value"] > 0)
+    df["included_for_weights"] = (
+        df["included_for_pricing"]
+        & df["realized_spend"].notna()
+        & (df["realized_spend"] > 0)
+    )
     if not ctrls.include_open_orders_in_weights:
         df.loc[df["is_open_order"], "included_for_weights"] = False
 

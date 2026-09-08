@@ -157,128 +157,144 @@ def fit_repeat_sales(
     lambdas_override: Optional[dict[str, float]] = None,
     max_iter_override: Optional[int] = None,
 ) -> RepeatSalesResult:
+    """Fit an identified robust interval model.
+
+    The old implementation estimated an overall monthly effect plus a complete
+    set of category-month effects in one rank-deficient design. V2 fits the
+    overall direct-cost index once, then fits each category on its own rows and
+    shrinks the category path toward the overall path. The public result shape
+    remains compatible: ``u[c]`` is the identified category-minus-overall path.
+    """
     warnings: list[str] = []
     if pairs is None or pairs.empty:
-        warnings.append("No adjacent pairs available; hierarchical model unavailable")
         return RepeatSalesResult(
-            months=[],
-            categories=[],
-            delta0=np.array([]),
-            u=np.zeros((0, 0)),
-            gamma0=0.0,
-            kappa=np.array([]),
-            pair_weights=np.array([]),
-            sigma=np.nan,
-            converged=False,
-            n_pairs=0,
-            n_pairs_used=0,
-            warnings=warnings,
+            months=[], categories=[], delta0=np.array([]), u=np.zeros((0, 0)),
+            gamma0=0.0, kappa=np.array([]), pair_weights=np.array([]), sigma=np.nan,
+            converged=False, n_pairs=0, n_pairs_used=0,
+            warnings=["No consecutive repeat-purchase pairs available"],
         )
 
     ctrls = config.controls
-    pairs = flag_extreme_pairs(
+    work = flag_extreme_pairs(
         pairs,
         ratio_low=ctrls.extreme_ratio_low,
         ratio_high=ctrls.extreme_ratio_high,
         max_days=ctrls.extreme_ratio_max_days,
-    )
-    # Note: fast_mode must not subsample pairs (would change fundamental estimates).
-
-    D, months = month_coverage_matrix(pairs)
-    if len(months) == 0:
-        warnings.append("No month coverage; hierarchical model unavailable")
+    ).reset_index(drop=True)
+    D, months = month_coverage_matrix(work)
+    if D.shape[1] == 0:
         return RepeatSalesResult(
-            months=[],
-            categories=[],
-            delta0=np.array([]),
-            u=np.zeros((0, 0)),
-            gamma0=0.0,
-            kappa=np.array([]),
-            pair_weights=np.array([]),
-            sigma=np.nan,
-            converged=False,
-            n_pairs=len(pairs),
-            n_pairs_used=0,
-            warnings=warnings,
+            months=[], categories=[], delta0=np.array([]), u=np.zeros((0, 0)),
+            gamma0=0.0, kappa=np.array([]), pair_weights=np.array([]), sigma=np.nan,
+            converged=False, n_pairs=len(work), n_pairs_used=0,
+            warnings=["No calendar-month exposure could be constructed"],
         )
 
-    # Category list with minimum pairs (sparse cats still present but shrink hard)
-    cat_counts = pairs["approved_category"].value_counts()
-    categories = sorted(cat_counts.index.astype(str).tolist())
-    w = _pair_weights(pairs, ctrls.pair_weight_method)
-    if downweight_extremes:
-        w = w * np.where(pairs["extreme_flag"].to_numpy(), 0.25, 1.0)
-        w = w / w.mean()
-
-    X, y, meta = _build_design(pairs, D, categories, ctrls.quantity_adjustment_mode)
-    M, C = meta["M"], meta["C"]
     lambdas = {
-        "smooth": ctrls.lambda_smooth,
-        "ridge": ctrls.lambda_ridge,
-        "u": ctrls.lambda_u,
-        "us": ctrls.lambda_us,
-        "gamma": ctrls.lambda_gamma,
+        "smooth": float(ctrls.lambda_smooth),
+        "ridge": float(ctrls.lambda_ridge),
+        "gamma": float(ctrls.lambda_gamma),
     }
     if lambdas_override:
-        lambdas.update({k: float(v) for k, v in lambdas_override.items() if k in lambdas})
-    R = _penalty_matrix(M, C, lambdas)
+        for key in lambdas:
+            if key in lambdas_override:
+                lambdas[key] = float(lambdas_override[key])
 
-    # IRLS with Huber weights
-    n_params = X.shape[1]
-    theta = np.zeros(n_params)
-    sigma = 1.0
-    converged = False
-    delta = ctrls.huber_delta
-    # Fewer IRLS iterations in fast_mode is a solver tolerance only (same data/objective).
-    max_iter = 30 if not ctrls.fast_mode else 12
-    if max_iter_override is not None:
-        max_iter = int(max_iter_override)
+    base_weights = _pair_weights(work, ctrls.pair_weight_method)
+    if downweight_extremes:
+        base_weights *= np.where(work["extreme_flag"].to_numpy(), 0.25, 1.0)
+        base_weights /= base_weights.mean()
 
-    sqrt_w = np.sqrt(w)
-    for it in range(max_iter):
-        pred = X @ theta
-        resid = y - pred
-        sigma = max(1e-6, float(np.median(np.abs(resid - np.median(resid))) / 0.6745))
-        r_std = resid / sigma
-        # Huber weight
-        huber_w = np.ones_like(r_std)
-        mask = np.abs(r_std) > delta
-        huber_w[mask] = delta / np.abs(r_std[mask])
-        ww = sqrt_w * np.sqrt(huber_w)
+    quantity_enabled = ctrls.quantity_adjustment_mode == QuantityAdjustmentMode.estimate
+    # Fast mode reduces resampling/backtest breadth, not the numerical standard
+    # required for an official fit. The real workbooks need about 20 iterations.
+    max_iter = int(max_iter_override or (30 if ctrls.fast_mode else 60))
 
-        Xw = sparse.diags(ww) @ X
-        yw = ww * y
-        # Augment with penalty
-        X_aug = sparse.vstack([Xw, R]).tocsr()
-        y_aug = np.concatenate([yw, np.zeros(R.shape[0])])
-        sol = lsqr(X_aug, y_aug, atol=1e-6, btol=1e-6, iter_lim=2000)
-        theta_new = sol[0]
-        if np.linalg.norm(theta_new - theta) < 1e-6 * (1 + np.linalg.norm(theta)):
+    def fit_one(
+        subset: pd.DataFrame,
+        d_sub: np.ndarray,
+        w_sub: np.ndarray,
+    ) -> tuple[np.ndarray, float, float, bool]:
+        m = d_sub.shape[1]
+        blocks = [sparse.csr_matrix(d_sub)]
+        if quantity_enabled:
+            blocks.append(sparse.csr_matrix(subset["x_q"].to_numpy(float).reshape(-1, 1)))
+        X = sparse.hstack(blocks, format="csr")
+        y = subset["y"].to_numpy(float)
+
+        penalty_rows: list[sparse.csr_matrix] = []
+        n_params = X.shape[1]
+        if m >= 3 and lambdas["smooth"] > 0:
+            d2 = sparse.diags(
+                [np.ones(m - 2), -2 * np.ones(m - 2), np.ones(m - 2)],
+                [0, 1, 2], shape=(m - 2, m), format="csr"
+            )
+            if quantity_enabled:
+                d2 = sparse.hstack([d2, sparse.csr_matrix((m - 2, 1))], format="csr")
+            penalty_rows.append(np.sqrt(lambdas["smooth"]) * d2)
+        if lambdas["ridge"] > 0:
+            ridge = sparse.eye(m, format="csr")
+            if quantity_enabled:
+                ridge = sparse.hstack([ridge, sparse.csr_matrix((m, 1))], format="csr")
+            penalty_rows.append(np.sqrt(lambdas["ridge"]) * ridge)
+        if quantity_enabled and lambdas["gamma"] > 0:
+            row = sparse.csr_matrix(([np.sqrt(lambdas["gamma"])], ([0], [n_params - 1])), shape=(1, n_params))
+            penalty_rows.append(row)
+        R = sparse.vstack(penalty_rows, format="csr") if penalty_rows else sparse.csr_matrix((0, n_params))
+
+        theta = np.zeros(n_params, dtype=float)
+        sigma = 1.0
+        converged = False
+        sqrt_base = np.sqrt(np.clip(w_sub, 1e-12, None))
+        for _ in range(max_iter):
+            residual = y - X @ theta
+            sigma = max(
+                1e-6,
+                float(np.median(np.abs(residual - np.median(residual))) / 0.6745),
+            )
+            standardized = residual / sigma
+            huber = np.ones_like(standardized)
+            outlier = np.abs(standardized) > ctrls.huber_delta
+            huber[outlier] = ctrls.huber_delta / np.abs(standardized[outlier])
+            ww = sqrt_base * np.sqrt(huber)
+            X_aug = sparse.vstack([sparse.diags(ww) @ X, R], format="csr")
+            y_aug = np.concatenate([ww * y, np.zeros(R.shape[0])])
+            sol = lsqr(X_aug, y_aug, atol=1e-7, btol=1e-7, iter_lim=4000)
+            theta_new = sol[0]
+            relative_change = np.linalg.norm(theta_new - theta) / (1.0 + np.linalg.norm(theta))
             theta = theta_new
-            converged = True
-            break
-        theta = theta_new
+            if relative_change < 1e-6:
+                converged = True
+                break
+        rates = theta[:m]
+        gamma = float(theta[-1]) if quantity_enabled else 0.0
+        return rates, gamma, sigma, converged
 
-    delta0 = theta[:M]
-    u = theta[M : M + C * M].reshape(C, M) if C else np.zeros((0, M))
-    gamma0 = float(theta[M + C * M]) if n_params > M + C * M else 0.0
-    kappa = theta[M + C * M + 1 :] if C else np.array([])
-
-    if abs(gamma0) > 1.0:
-        warnings.append(
-            f"Quantity elasticity gamma0={gamma0:.3f} is large in magnitude; treat with caution"
-        )
+    delta0, gamma0, sigma, converged = fit_one(work, D, base_weights)
     if not converged:
-        warnings.append("Repeat-sales IRLS did not fully converge; using last iterate")
+        warnings.append("Overall repeat-sales IRLS did not converge; official outputs must be blocked")
+    if abs(gamma0) > 1.0:
+        warnings.append(f"Quantity elasticity {gamma0:.3f} is economically extreme")
 
-    # Zero out category deviations for very sparse categories (shrink to overall)
-    for i, cat in enumerate(categories):
-        if cat_counts.get(cat, 0) < ctrls.category_min_pairs:
-            u[i] = u[i] * (cat_counts.get(cat, 0) / max(ctrls.category_min_pairs, 1))
-
-    if ctrls.quantity_adjustment_mode == QuantityAdjustmentMode.zero:
-        gamma0 = 0.0
-        kappa = np.zeros_like(kappa)
+    category_series = work["approved_category"].fillna("Uncategorized").astype(str)
+    categories = sorted(category_series.unique().tolist())
+    u = np.zeros((len(categories), len(months)), dtype=float)
+    kappa = np.zeros(len(categories), dtype=float)
+    for ci, category in enumerate(categories):
+        mask = category_series.eq(category).to_numpy()
+        n_cat = int(mask.sum())
+        if n_cat < max(8, min(25, ctrls.category_min_pairs)):
+            warnings.append(f"{category}: only {n_cat} pairs; using overall fallback")
+            continue
+        rates_c, gamma_c, _, converged_c = fit_one(
+            work.loc[mask].reset_index(drop=True), D[mask], base_weights[mask]
+        )
+        if not converged_c:
+            warnings.append(f"{category}: category fit did not converge; using overall fallback")
+            continue
+        shrink = n_cat / (n_cat + max(float(ctrls.category_min_pairs), 1.0))
+        u[ci] = shrink * (rates_c - delta0)
+        kappa[ci] = shrink * (gamma_c - gamma0)
 
     result = RepeatSalesResult(
         months=months,
@@ -287,22 +303,17 @@ def fit_repeat_sales(
         u=u,
         gamma0=gamma0,
         kappa=kappa,
-        pair_weights=w,
+        pair_weights=base_weights,
         sigma=float(sigma),
         converged=converged,
-        n_pairs=len(pairs),
-        n_pairs_used=len(pairs),
+        n_pairs=len(work),
+        n_pairs_used=len(work),
         warnings=warnings,
-        train_pairs=pairs,
+        train_pairs=work,
     )
     logger.info(
-        "Fitted repeat-sales model: months=%s cats=%s pairs=%s gamma0=%.4f sigma=%.4f converged=%s",
-        M,
-        C,
-        len(pairs),
-        gamma0,
-        sigma,
-        converged,
+        "Fitted identified repeat-sales model: months=%s categories=%s pairs=%s gamma=%.4f converged=%s",
+        len(months), len(categories), len(work), gamma0, converged,
     )
     return result
 

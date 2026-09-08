@@ -32,5 +32,5 @@ python -m pip install -e .
 echo ""
 echo "Setup complete. Place PO workbooks in data/raw/ then run:"
 echo "  source .venv/bin/activate"
-echo "  python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09"
+echo "  python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs"
 echo "Or double-click run_mac.command"

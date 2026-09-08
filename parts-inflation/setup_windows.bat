@@ -8,17 +8,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-py -3.11 -c "import sys" >nul 2>&1
+py -3 -c "import sys; assert sys.version_info >= (3, 11)" >nul 2>&1
 if errorlevel 1 (
-  py -3.12 -c "import sys" >nul 2>&1
-  if errorlevel 1 (
-    echo ERROR: Python 3.11+ is required.
-    exit /b 1
-  )
-  set PY=py -3.12
-) else (
-  set PY=py -3.11
+  echo ERROR: Python 3.11+ is required.
+  exit /b 1
 )
+set PY=py -3
 
 echo Using %PY%
 %PY% -m venv .venv
@@ -29,5 +24,5 @@ python -m pip install -e .
 echo.
 echo Setup complete. Place PO workbooks in data\raw\ then run:
 echo   .venv\Scripts\activate
-echo   python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
+echo   python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs
 echo Or double-click run_windows.bat
