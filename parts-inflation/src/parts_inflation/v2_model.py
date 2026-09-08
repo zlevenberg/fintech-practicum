@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import gc
 from dataclasses import dataclass
 from typing import Optional
 
@@ -20,6 +22,19 @@ from parts_inflation.repeat_sales import RepeatSalesResult, fit_repeat_sales
 
 
 FORECAST_METHODS = ("trailing_12m_mean", "ewma", "mean_reversion", "damped_holt")
+
+
+def _release_iteration_memory() -> None:
+    """Release large refit temporaries between rolling/bootstrap iterations."""
+    gc.collect()
+    # CPython can free objects while glibc retains their pages. Returning those
+    # pages keeps a 100-refit production run bounded. malloc_trim is absent on
+    # macOS/Windows, where garbage collection above remains the portable path.
+    try:
+        malloc_trim = getattr(ctypes.CDLL(None), "malloc_trim")
+        malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
 
 
 @dataclass
@@ -514,9 +529,13 @@ def run_composite_backtest(
             continue
         model = fit_repeat_sales(train_pairs, config)
         if not model.converged:
+            del model, train_pairs, train_daily
+            _release_iteration_memory()
             continue
         actual = _actual_matched_basket(daily, cutoff, 12, config)
         if actual.empty or actual["weight"].sum() <= 0:
+            del actual, model, train_pairs, train_daily
+            _release_iteration_memory()
             continue
         actual_composite = float(np.sum(actual["weight"] * actual["actual_multiplier"]))
         # Basket weights are cutoff-only; future records cannot affect them.
@@ -550,6 +569,8 @@ def run_composite_backtest(
                     "signed_error": predicted - actual_composite,
                 }
             )
+        del forecast, model, train_pairs, train_daily, actual, weights
+        _release_iteration_memory()
     detail_df = pd.DataFrame(detail)
     if detail_df.empty:
         return detail_df, pd.DataFrame(), "trailing_12m_mean"
@@ -590,17 +611,32 @@ def bootstrap_forecasts(
             sample = pairs.copy()
         else:
             draws = rng.choice(entities, size=len(entities), replace=True)
-            chunks = []
+            # Construct one sampled frame rather than tens of thousands of
+            # per-entity DataFrames.  The former concat pattern retained a very
+            # large amount of pandas allocator memory across 100 refits and
+            # could be killed by the host before report assembly.
+            sampled_indices: list[np.ndarray] = []
+            sampled_keys: list[np.ndarray] = []
             for draw_no, entity in enumerate(draws):
-                chunk = pairs.iloc[groups[entity]].copy()
-                chunk["PartKey"] = f"{entity}__BOOT{draw_no}"
-                chunks.append(chunk)
-            sample = pd.concat(chunks, ignore_index=True)
+                entity_indices = np.asarray(groups[entity], dtype=np.int64)
+                sampled_indices.append(entity_indices)
+                sampled_keys.append(
+                    np.full(entity_indices.size, f"{entity}__BOOT{draw_no}", dtype=object)
+                )
+            take = np.concatenate(sampled_indices)
+            sample = pairs.iloc[take].copy().reset_index(drop=True)
+            sample["PartKey"] = np.concatenate(sampled_keys)
         model = fit_repeat_sales(sample, config, max_iter_override=30 if config.controls.fast_mode else 60)
+        fitted_pairs = model.train_pairs if model.train_pairs is not None else sample
+        del sample
         if not model.converged:
+            del model, fitted_pairs
+            if iteration:
+                del draws, take, sampled_indices, sampled_keys
+            _release_iteration_memory()
             continue
         forecast = build_forecasts(
-            model, sample, bucket_weights, base_date, config,
+            model, fitted_pairs, bucket_weights, base_date, config,
             committed_summary=committed_summary, forced_method=selected_method,
         )
         for _, row in forecast.composite_forecast.iterrows():
@@ -611,6 +647,10 @@ def bootstrap_forecasts(
                     "cumulative_multiplier": float(row["cumulative_multiplier"]),
                 }
             )
+        del forecast, model, fitted_pairs
+        if iteration:
+            del draws, take, sampled_indices, sampled_keys
+        _release_iteration_memory()
     sample_df = pd.DataFrame(samples)
     if sample_df.empty:
         return sample_df, {"success_rate": 0.0, "attempts": attempts}

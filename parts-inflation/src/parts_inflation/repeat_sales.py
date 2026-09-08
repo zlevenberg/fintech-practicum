@@ -9,7 +9,6 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from scipy.sparse.linalg import lsqr
 
 from parts_inflation.config import QuantityAdjustmentMode, ResolvedConfig
 from parts_inflation.matched_pairs import flag_extreme_pairs, month_coverage_matrix
@@ -216,36 +215,26 @@ def fit_repeat_sales(
         w_sub: np.ndarray,
     ) -> tuple[np.ndarray, float, float, bool]:
         m = d_sub.shape[1]
-        blocks = [sparse.csr_matrix(d_sub)]
+        blocks = [d_sub]
         if quantity_enabled:
-            blocks.append(sparse.csr_matrix(subset["x_q"].to_numpy(float).reshape(-1, 1)))
-        X = sparse.hstack(blocks, format="csr")
+            blocks.append(subset["x_q"].to_numpy(float).reshape(-1, 1))
+        X = np.column_stack(blocks)
         y = subset["y"].to_numpy(float)
 
-        penalty_rows: list[sparse.csr_matrix] = []
         n_params = X.shape[1]
+        penalty_gram = np.zeros((n_params, n_params), dtype=float)
         if m >= 3 and lambdas["smooth"] > 0:
-            d2 = sparse.diags(
-                [np.ones(m - 2), -2 * np.ones(m - 2), np.ones(m - 2)],
-                [0, 1, 2], shape=(m - 2, m), format="csr"
-            )
-            if quantity_enabled:
-                d2 = sparse.hstack([d2, sparse.csr_matrix((m - 2, 1))], format="csr")
-            penalty_rows.append(np.sqrt(lambdas["smooth"]) * d2)
+            d2 = np.diff(np.eye(m), n=2, axis=0)
+            penalty_gram[:m, :m] += lambdas["smooth"] * (d2.T @ d2)
         if lambdas["ridge"] > 0:
-            ridge = sparse.eye(m, format="csr")
-            if quantity_enabled:
-                ridge = sparse.hstack([ridge, sparse.csr_matrix((m, 1))], format="csr")
-            penalty_rows.append(np.sqrt(lambdas["ridge"]) * ridge)
+            penalty_gram[np.arange(m), np.arange(m)] += lambdas["ridge"]
         if quantity_enabled and lambdas["gamma"] > 0:
-            row = sparse.csr_matrix(([np.sqrt(lambdas["gamma"])], ([0], [n_params - 1])), shape=(1, n_params))
-            penalty_rows.append(row)
-        R = sparse.vstack(penalty_rows, format="csr") if penalty_rows else sparse.csr_matrix((0, n_params))
+            penalty_gram[-1, -1] += lambdas["gamma"]
 
         theta = np.zeros(n_params, dtype=float)
         sigma = 1.0
         converged = False
-        sqrt_base = np.sqrt(np.clip(w_sub, 1e-12, None))
+        safe_base = np.clip(w_sub, 1e-12, None)
         for _ in range(max_iter):
             residual = y - X @ theta
             sigma = max(
@@ -256,11 +245,17 @@ def fit_repeat_sales(
             huber = np.ones_like(standardized)
             outlier = np.abs(standardized) > ctrls.huber_delta
             huber[outlier] = ctrls.huber_delta / np.abs(standardized[outlier])
-            ww = sqrt_base * np.sqrt(huber)
-            X_aug = sparse.vstack([sparse.diags(ww) @ X, R], format="csr")
-            y_aug = np.concatenate([ww * y, np.zeros(R.shape[0])])
-            sol = lsqr(X_aug, y_aug, atol=1e-7, btol=1e-7, iter_lim=4000)
-            theta_new = sol[0]
+            obs_weight = safe_base * huber
+            # There are only roughly 47 coefficients in the current data.
+            # Solving the small penalized normal equations is exactly the same
+            # weighted least-squares step as the former augmented sparse LSQR,
+            # but is orders of magnitude faster for repeated bootstrap fits.
+            lhs = X.T @ (X * obs_weight[:, None]) + penalty_gram
+            rhs = X.T @ (obs_weight * y)
+            try:
+                theta_new = np.linalg.solve(lhs, rhs)
+            except np.linalg.LinAlgError:
+                theta_new = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
             relative_change = np.linalg.norm(theta_new - theta) / (1.0 + np.linalg.norm(theta))
             theta = theta_new
             if relative_change < 1e-6:
