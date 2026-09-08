@@ -315,11 +315,21 @@ def test_fixed_basket_composite_identity():
     muls = np.array([1.1, 1.0, 1.2])
     M = float(np.sum(weights * muls))
     assert M == pytest.approx(0.2 * 1.1 + 0.5 * 1.0 + 0.3 * 1.2)
+    # Pipeline-style weight construction
+    q_star = np.array([2.0, 5.0, 3.0])
+    p0 = np.array([10.0, 10.0, 10.0])
+    w = q_star * p0
+    w = w / w.sum()
+    m = np.array([1.05, 1.10, 0.95])
+    assert float(np.sum(w * m)) == pytest.approx(float(np.dot(w, m)))
 
 
 def test_no_lookahead_in_backtest_dates(cfg):
-    """Ensure last_price_forecast never returns dates after cutoff."""
+    """Ensure last_price_forecast and backtest training never use post-cutoff prices."""
+    from parts_inflation.backtest import run_backtests
     from parts_inflation.benchmarks import last_price_forecast
+    from parts_inflation.classify import apply_scope_and_category
+    from parts_inflation.clean import clean_po_lines
 
     daily = pd.DataFrame(
         {
@@ -334,6 +344,40 @@ def test_no_lookahead_in_backtest_dates(cfg):
     last = last_price_forecast(daily, cutoff)
     assert last.iloc[0]["latest_date"] <= cutoff
     assert last.iloc[0]["latest_price"] == 10.0
+
+    # Synthetic classified panel spanning enough history for a cutoff
+    rows = []
+    for part in range(8):
+        for m in range(30):
+            d = pd.Timestamp("2022-01-15") + pd.DateOffset(months=m)
+            rows.append(
+                {
+                    "P.O. Date": d,
+                    "Part Number": f"L{part}",
+                    "Description 1": "WIDGET",
+                    "Description 2": "",
+                    "Cost": 10.0 * (1.01 ** m),
+                    "Qty Ordered": 1,
+                    "Qty Received": 1,
+                    "Extension (Qty Received)": 10.0,
+                    "PO Value": 10.0 * (1.01 ** m),
+                    "Bucket": "1210AC",
+                    "Description": "Inventory",
+                    "source_file": "t.xlsx",
+                    "source_sheet": "Sheet2",
+                    "source_row_number": m + 2,
+                    "raw_part_number": f"L{part}",
+                    "raw_part_number_type": "str",
+                }
+            )
+    cleaned = clean_po_lines(pd.DataFrame(rows), cfg)
+    classified, _ = apply_scope_and_category(cleaned, cfg)
+    cfg.controls.fast_mode = True
+    cfg.controls.bootstrap_iterations = 2
+    bt = run_backtests(classified, cfg)
+    if not bt.detail.empty:
+        assert (pd.to_datetime(bt.detail["base_date"]) <= pd.to_datetime(bt.detail["cutoff"])).all()
+        assert (pd.to_datetime(bt.detail["actual_date"]) > pd.to_datetime(bt.detail["cutoff"])).all()
 
 
 def test_reproducible_bootstrap(cfg):
@@ -358,7 +402,129 @@ def test_reproducible_bootstrap(cfg):
     b = bootstrap_composite_and_parts(
         daily, pairs, daily, weights, pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-01"), cfg, "trailing_12m_mean"
     )
+    assert a["method"] == "part_cluster_bootstrap"
     assert np.allclose(a["composite_samples"], b["composite_samples"])
+
+
+def test_manual_price_and_future_qty_overrides(cfg):
+    from parts_inflation.classify import apply_scope_and_category
+    from parts_inflation.clean import clean_po_lines
+
+    raw = pd.DataFrame(
+        {
+            "P.O. Date": ["2024-01-01"],
+            "Part Number": ["OV1"],
+            "Description 1": ["WIDGET"],
+            "Description 2": [""],
+            "Cost": [10.0],
+            "Qty Ordered": [5],
+            "Qty Received": [5],
+            "Extension (Qty Received)": [50],
+            "PO Value": [50],
+            "Bucket": ["1210AC"],
+            "Description": ["Inventory"],
+            "source_file": ["t.xlsx"],
+            "source_sheet": ["Sheet2"],
+            "source_row_number": [2],
+            "raw_part_number": ["OV1"],
+            "raw_part_number_type": ["str"],
+        }
+    )
+    cfg.part_overrides = pd.DataFrame(
+        [
+            {
+                "PartKey": "OV1",
+                "ManualCurrentPrice": 99.0,
+                "ManualFutureQuantity": 42.0,
+            }
+        ]
+    )
+    cleaned = clean_po_lines(raw, cfg)
+    classified, _ = apply_scope_and_category(cleaned, cfg)
+    assert float(classified["manual_current_price"].iloc[0]) == 99.0
+    assert float(classified["manual_future_quantity"].iloc[0]) == 42.0
+    # Historical Cost unchanged
+    assert float(classified["price"].iloc[0]) == 10.0
+
+
+def test_future_category_rate_uses_u_c(cfg):
+    from parts_inflation.repeat_sales import RepeatSalesResult
+
+    months = [pd.Period("2024-01", "M"), pd.Period("2024-02", "M")]
+    model = RepeatSalesResult(
+        months=months,
+        categories=["Inventory"],
+        delta0=np.array([0.0, 0.0]),
+        u=np.array([[0.0, 0.05]]),  # +5% category deviation in Feb
+        gamma0=0.0,
+        kappa=np.array([0.0]),
+        pair_weights=np.array([]),
+        sigma=0.1,
+        converged=True,
+        n_pairs=10,
+        n_pairs_used=10,
+    )
+    # Future month Mar with overall future rate 0 and û_c = mean([0,0.05])=0.025
+    future_months = [pd.Period("2024-03", "M")]
+    future_rates = np.array([0.0])
+    m = multiplier_category(
+        model,
+        "Inventory",
+        pd.Timestamp("2024-02-29"),
+        pd.Timestamp("2024-03-31"),
+        future_rates,
+        future_months,
+    )
+    assert m == pytest.approx(np.exp(0.025), rel=1e-6)
+
+
+def test_purchasing_cost_differs_from_fixed_basket_when_qty_changes():
+    q_star = np.array([1.0, 1.0])
+    q_future = np.array([1.0, 3.0])
+    p0 = np.array([10.0, 10.0])
+    m = np.array([1.1, 1.1])
+    w = (q_star * p0) / (q_star * p0).sum()
+    fixed = float(np.sum(w * m)) - 1.0
+    c0 = float(np.sum(q_future * p0))
+    c1 = float(np.sum(q_future * p0 * m))
+    purch = c1 / c0 - 1.0
+    # Same multipliers → same inflation rate, but purchasing cost level uses q_future
+    assert fixed == pytest.approx(0.1)
+    assert purch == pytest.approx(0.1)
+    # Level of C changes with mix even when M is identical
+    assert c1 != float(np.sum(q_star * p0 * m))
+
+
+def test_extremes_sensitivity_variants_present(cfg):
+    from parts_inflation.matched_pairs import flag_extreme_pairs
+
+    pairs = pd.DataFrame(
+        {
+            "PartKey": ["A", "B"],
+            "date_a": pd.to_datetime(["2023-01-01", "2023-01-01"]),
+            "date_b": pd.to_datetime(["2023-06-01", "2023-06-01"]),
+            "price_a": [10.0, 10.0],
+            "price_b": [11.0, 50.0],
+            "price_ratio": [1.1, 5.0],
+            "qty_a": [1, 1],
+            "qty_b": [1, 1],
+            "y": [np.log(1.1), np.log(5.0)],
+            "delta_days": [151, 151],
+            "delta_years": [151 / 365.25, 151 / 365.25],
+            "approved_category": ["Inventory", "Inventory"],
+            "n_pairs_part": [1, 1],
+            "spend_a": [10, 10],
+            "spend_b": [11, 50],
+            "x_q": [0.0, 0.0],
+            "qty_comparable": [True, True],
+        }
+    )
+    flagged = flag_extreme_pairs(pairs, 0.25, 4.0, 548)
+    assert "extreme_flag" in flagged.columns
+    assert flagged["extreme_flag"].sum() >= 1
+    with_ext = flagged
+    without = flagged.loc[~flagged["extreme_flag"]]
+    assert len(without) < len(with_ext)
 
 
 def test_config_cli_default_precedence(tmp_path):
@@ -411,12 +577,16 @@ def test_excel_report_has_required_sheets(tmp_path):
             "composite_p90": 1.03,
             "annualized_p50": 0.02,
             "cost_change_p50": 0.02,
+            "fixed_basket_inflation_p50": 0.02,
+            "purchasing_cost_change_p50": 0.05,
             "matched_spend_coverage": 0.5,
             "pct_weight_part": 0.2,
             "pct_weight_category": 0.5,
             "pct_weight_overall": 0.3,
             "selected_model": "hierarchical",
+            "selection_rationale": "test",
             "forecast_method": "trailing_12m_mean",
+            "uncertainty_method": "part_cluster_bootstrap",
             "long_horizon_warning": "None",
         },
         "controls_used": pd.DataFrame([{"key": "a", "value": "1", "source": "Default", "description": "d"}]),

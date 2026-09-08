@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from typing import Optional
 
 import numpy as np
@@ -85,6 +84,29 @@ def _batch_multipliers(
     return muls
 
 
+def _resample_pairs_by_part(pairs: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """Sample parts with replacement; keep all observations for each sampled part."""
+    if pairs.empty:
+        return pairs.iloc[0:0].copy()
+    parts = pairs["PartKey"].astype(str).to_numpy()
+    unique_parts = np.unique(parts)
+    sampled = rng.choice(unique_parts, size=len(unique_parts), replace=True)
+    # Build index lists per part once
+    groups = pairs.groupby(pairs["PartKey"].astype(str), sort=False).indices
+    chunks = []
+    for i, part in enumerate(sampled):
+        idx = groups.get(part)
+        if idx is None or len(idx) == 0:
+            continue
+        chunk = pairs.iloc[idx].copy()
+        # Disambiguate duplicate part draws
+        chunk["PartKey"] = f"{part}__boot{i}"
+        chunks.append(chunk)
+    if not chunks:
+        return pairs.iloc[0:0].copy()
+    return pd.concat(chunks, ignore_index=True)
+
+
 def bootstrap_composite_and_parts(
     daily: pd.DataFrame,
     pairs: pd.DataFrame,
@@ -96,17 +118,18 @@ def bootstrap_composite_and_parts(
     selected_forecast: str,
     model: Optional[RepeatSalesResult] = None,
     part_hier: Optional[pd.DataFrame] = None,
+    lambdas_override: Optional[dict[str, float]] = None,
 ) -> dict:
     """
-    Uncertainty via parametric perturbation of fitted monthly rates and residuals
-    (default for large samples), with optional part-cluster refits for smaller samples.
+    Part-cluster bootstrap: resample parts with replacement, keep all pairs for each
+    sampled part, refit the hierarchical model, and recompute multipliers.
     """
     ctrls = config.controls
     n_boot = max(2, int(ctrls.bootstrap_iterations))
     rng = np.random.default_rng(ctrls.random_seed)
 
     weights = weights[weights > 0].copy()
-    # Keep top weights covering 99.5% for speed; remaining mass redistributed
+    # Cap weight set for multiplier aggregation speed only (fit still uses full resampled pairs)
     if len(weights) > 5000:
         weights = weights.sort_values(ascending=False)
         cdf = weights.cumsum() / weights.sum()
@@ -116,7 +139,7 @@ def bootstrap_composite_and_parts(
         weights = keep / keep.sum()
 
     if model is None:
-        model = fit_repeat_sales(pairs, config)
+        model = fit_repeat_sales(pairs, config, lambdas_override=lambdas_override)
     if part_hier is None:
         part_hier = compute_part_residuals(pairs, model, config)
 
@@ -133,29 +156,66 @@ def bootstrap_composite_and_parts(
     ww = ww / ww.sum() if ww.sum() > 0 else ww
     point_comp = float(sum(ww[p] * point_muls[p] for p in ww.index)) if len(ww) else 1.0
 
-    resid_scale = model.sigma if np.isfinite(getattr(model, "sigma", np.nan)) else 0.05
+    # Category point multipliers for interval samples
+    cats = sorted(
+        set(
+            list(part_hier["category"].dropna().astype(str))
+            if not part_hier.empty and "category" in part_hier.columns
+            else []
+        )
+        | set(model.categories)
+    )
+    cat_point = {
+        c: multiplier_category(model, c, base_date, target_date, cand.monthly_rates, cand.months)
+        for c in cats
+    }
+
     composite_samples = [point_comp]
     part_samples: dict[str, list[float]] = {p: [point_muls[p]] for p in point_muls}
+    cat_samples: dict[str, list[float]] = {c: [cat_point[c]] for c in cats}
 
-    use_parametric = True  # scalable default; still reflects sampling/forecast uncertainty
+    # Forecast-method residual scale from rolling selection MAE if available
+    fc_err = max(getattr(model, "sigma", 0.05) or 0.05, 1e-4) * 0.15
 
-    for _ in range(n_boot - 1):
-        noise = (
-            rng.normal(0, max(resid_scale, 1e-4) * 0.25, size=len(model.delta0))
-            if len(model.delta0)
-            else np.array([])
+    for b in range(n_boot - 1):
+        boot_pairs = _resample_pairs_by_part(pairs, rng)
+        if boot_pairs.empty:
+            continue
+        # Bootstrap refits use fewer IRLS iterations (uncertainty sampling, same objective).
+        boot_iter = 8 if ctrls.fast_mode else 15
+        model_b = fit_repeat_sales(
+            boot_pairs,
+            config,
+            lambdas_override=lambdas_override,
+            max_iter_override=boot_iter,
         )
-        delta_b = model.delta0 + noise if len(model.delta0) else model.delta0
-        model_b = replace(model, delta0=delta_b)
-        part_hier_b = part_hier.copy()
-        if not part_hier_b.empty and "shrunk_residual" in part_hier_b.columns:
+        if model_b.n_pairs_used == 0:
+            continue
+        # Recompute residuals on boot_pairs then map keys back.
+        part_hier_b = compute_part_residuals(boot_pairs, model_b, config)
+        if not part_hier_b.empty:
             part_hier_b = part_hier_b.copy()
-            part_hier_b["shrunk_residual"] = part_hier_b["shrunk_residual"].to_numpy() + rng.normal(
-                0, 0.02, size=len(part_hier_b)
+            part_hier_b["PartKey"] = (
+                part_hier_b["PartKey"].astype(str).str.replace(r"__boot\d+$", "", regex=True)
             )
-        fut_noise = rng.normal(0, max(resid_scale, 1e-4) * 0.25, size=len(cand.monthly_rates))
+            # Average duplicate draws of the same part
+            agg = {
+                "category": "first",
+                "source": "first",
+                "shrunk_residual": "mean",
+                "lambda_shrink": "mean",
+                "quality": "mean",
+                "n_pairs": "sum",
+                "span_days": "max",
+            }
+            agg = {k: v for k, v in agg.items() if k in part_hier_b.columns}
+            part_hier_b = part_hier_b.groupby("PartKey", as_index=False).agg(agg)
+        cands_b = build_forecast_candidates(model_b.delta0, model_b.months, target_date, base_date)
+        # Prefer same forecast method name; add forecast-method error noise
+        cand_b = next((c for c in cands_b if c.name == best_fc), cands_b[0] if cands_b else cand)
+        fut_noise = rng.normal(0, fc_err, size=len(cand_b.monthly_rates))
         cand_b = ForecastCandidate(
-            cand.name, cand.monthly_rates + fut_noise, cand.months, cand.params
+            cand_b.name, cand_b.monthly_rates + fut_noise, cand_b.months, cand_b.params
         )
         muls = _batch_multipliers(
             model_b, part_hier_b, part_meta, weights, base_date, target_date, cand_b
@@ -168,6 +228,12 @@ def bootstrap_composite_and_parts(
         composite_samples.append(comp)
         for p, m in muls.items():
             part_samples.setdefault(p, []).append(m)
+        for c in cats:
+            cat_samples.setdefault(c, []).append(
+                multiplier_category(
+                    model_b, c, base_date, target_date, cand_b.monthly_rates, cand_b.months
+                )
+            )
 
     q_lo = ctrls.confidence_lower_quantile
     q_hi = ctrls.confidence_upper_quantile
@@ -175,6 +241,9 @@ def bootstrap_composite_and_parts(
     part_p10 = {p: float(np.quantile(v, q_lo)) for p, v in part_samples.items()}
     part_p50 = {p: float(np.quantile(v, 0.5)) for p, v in part_samples.items()}
     part_p90 = {p: float(np.quantile(v, q_hi)) for p, v in part_samples.items()}
+    cat_p10 = {c: float(np.quantile(v, q_lo)) for c, v in cat_samples.items()}
+    cat_p50 = {c: float(np.quantile(v, 0.5)) for c, v in cat_samples.items()}
+    cat_p90 = {c: float(np.quantile(v, q_hi)) for c, v in cat_samples.items()}
 
     logger.info(
         "Bootstrap complete: n=%s composite P10/P50/P90=%.4f/%.4f/%.4f method=%s",
@@ -182,7 +251,7 @@ def bootstrap_composite_and_parts(
         np.quantile(samples, q_lo),
         np.quantile(samples, 0.5),
         np.quantile(samples, q_hi),
-        "parametric_rate_bootstrap",
+        "part_cluster_bootstrap",
     )
     return {
         "composite_samples": samples,
@@ -192,11 +261,14 @@ def bootstrap_composite_and_parts(
         "part_p10": part_p10,
         "part_p50": part_p50,
         "part_p90": part_p90,
+        "category_p10": cat_p10,
+        "category_p50": cat_p50,
+        "category_p90": cat_p90,
         "point_composite": point_comp,
         "point_muls": point_muls,
         "model": model,
         "part_hier": part_hier,
         "forecast_candidate": cand,
         "forecast_method": best_fc,
-        "method": "parametric_rate_bootstrap",
+        "method": "part_cluster_bootstrap",
     }

@@ -16,6 +16,8 @@ def build_data_quality_table(
     pairs: pd.DataFrame,
     infos: list[SourceFileInfo],
     warnings: list[str],
+    base_date: Optional[pd.Timestamp] = None,
+    last_prices: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     def spend(mask) -> float:
         s = classified.loc[mask, "po_value"]
@@ -62,7 +64,25 @@ def build_data_quality_table(
             }
         )
 
-    # Source overlaps already in warnings
+    # Stale prices: latest observation more than 180 days before base date
+    if last_prices is not None and not last_prices.empty and "price_staleness_days" in last_prices.columns:
+        stale = last_prices["price_staleness_days"].fillna(0) > 180
+        spend_impact = float(
+            (
+                last_prices.loc[stale, "estimated_base_price"].fillna(0)
+                * last_prices.loc[stale, "q_star"].fillna(0)
+            ).sum()
+        ) if "estimated_base_price" in last_prices.columns and "q_star" in last_prices.columns else 0.0
+        rows.append(
+            {
+                "issue": "stale_prices_gt_180d",
+                "row_count": int(stale.sum()),
+                "po_value_impact": spend_impact,
+                "share_of_rows": float(stale.mean()) if len(stale) else 0.0,
+                "notes": f"Relative to base_date={base_date}",
+            }
+        )
+
     rows.append(
         {
             "issue": "source_file_warnings",

@@ -37,7 +37,7 @@ from parts_inflation.forecast import build_forecast_candidates, select_forecast_
 from parts_inflation.hierarchy import compute_part_residuals, multiplier_category, multiplier_part
 from parts_inflation.ingest import combined_fingerprint, load_all_po_lines, profile_sources
 from parts_inflation.matched_pairs import build_adjacent_pairs, flag_extreme_pairs
-from parts_inflation.repeat_sales import fit_repeat_sales
+from parts_inflation.repeat_sales import fit_repeat_sales, select_lambdas_by_inner_backtest
 from parts_inflation.report import write_results_workbook
 from parts_inflation.uncertainty import bootstrap_composite_and_parts, widen_interval
 
@@ -217,28 +217,113 @@ def run_pipeline(
         bm = compute_all_benchmarks(
             dly, config.controls.benchmark_winsor_lower, config.controls.benchmark_winsor_upper
         )
-        matched = bm.get("matched_quarterly", pd.DataFrame())
-        tq = bm.get("tornqvist_quarterly", pd.DataFrame())
-        last_pct = float(matched["capped_spend_weight_geom"].iloc[-1]) if not matched.empty else np.nan
-        last_tq = float(tq["pct_change"].dropna().iloc[-1]) if not tq.empty and tq["pct_change"].notna().any() else np.nan
-        scope_sensitivity_rows.append(
+        for freq, matched_key, tq_key in [
+            ("monthly", "matched_monthly", "tornqvist_monthly"),
+            ("quarterly", "matched_quarterly", "tornqvist_quarterly"),
+            ("fiscal_year", "matched_fiscal_year", "tornqvist_fiscal_year"),
+        ]:
+            matched = bm.get(matched_key, pd.DataFrame())
+            tq = bm.get(tq_key, pd.DataFrame())
+            last_pct = (
+                float(matched["capped_spend_weight_geom"].iloc[-1]) if not matched.empty else np.nan
+            )
+            last_tq = (
+                float(tq["pct_change"].dropna().iloc[-1])
+                if not tq.empty and "pct_change" in tq.columns and tq["pct_change"].notna().any()
+                else np.nan
+            )
+            match_count = int(matched["match_count"].iloc[-1]) if not matched.empty and "match_count" in matched.columns else 0
+            matched_spend = (
+                float(matched["matched_spend"].iloc[-1])
+                if not matched.empty and "matched_spend" in matched.columns
+                else np.nan
+            )
+            scope_sensitivity_rows.append(
+                {
+                    "scope": scope_name,
+                    "frequency": freq,
+                    "status": "ok",
+                    "part_days": len(dly),
+                    "distinct_parts": dly["PartKey"].nunique(),
+                    "latest_matched_spend_geom": last_pct,
+                    "latest_tornqvist": last_tq,
+                    "match_count": match_count,
+                    "matched_spend": matched_spend,
+                    "total_spend": float(dly["spend"].fillna(0).sum()),
+                }
+            )
+    scope_sensitivity = pd.DataFrame(scope_sensitivity_rows)
+
+    # Extremes with/without sensitivity on selected-scope quarterly matched/Törnqvist
+    extremes_rows = []
+    pairs_ext = flag_extreme_pairs(
+        pairs,
+        config.controls.extreme_ratio_low,
+        config.controls.extreme_ratio_high,
+        config.controls.extreme_ratio_max_days,
+    ) if not pairs.empty else pairs
+    for label, mask_fn in [
+        ("with_extremes", lambda p: p),
+        ("without_extremes", lambda p: p.loc[~p["extreme_flag"]] if "extreme_flag" in p.columns else p),
+    ]:
+        sub = mask_fn(pairs_ext)
+        if sub.empty:
+            extremes_rows.append({"variant": label, "status": "no_data"})
+            continue
+        # Build a pseudo period-price frame from pair endpoints for latest changes
+        from parts_inflation.benchmarks import matched_part_log_changes, period_part_prices
+
+        pp = period_part_prices(daily, "Q")
+        if label == "without_extremes" and not pairs_ext.empty and "extreme_flag" in pairs_ext.columns:
+            extreme_parts = set(pairs_ext.loc[pairs_ext["extreme_flag"], "PartKey"])
+            # Drop parts that ever had an extreme adjacent pair in the window for sensitivity
+            pp_f = pp.loc[~pp["PartKey"].isin(extreme_parts)]
+        else:
+            pp_f = pp
+        matched = matched_part_log_changes(
+            pp_f, config.controls.benchmark_winsor_lower, config.controls.benchmark_winsor_upper
+        )
+        from parts_inflation.benchmarks import tornqvist_index
+
+        tq = tornqvist_index(pp_f)
+        extremes_rows.append(
             {
-                "scope": scope_name,
+                "variant": label,
                 "status": "ok",
-                "part_days": len(dly),
-                "distinct_parts": dly["PartKey"].nunique(),
-                "latest_quarter_matched_spend_geom": last_pct,
-                "latest_quarter_tornqvist": last_tq,
-                "total_spend": float(dly["spend"].fillna(0).sum()),
+                "n_period_part_rows": len(pp_f),
+                "latest_matched_spend_geom": float(matched["capped_spend_weight_geom"].iloc[-1])
+                if not matched.empty
+                else np.nan,
+                "latest_tornqvist": float(tq["pct_change"].dropna().iloc[-1])
+                if not tq.empty and tq["pct_change"].notna().any()
+                else np.nan,
+                "extreme_pair_count": int(pairs_ext["extreme_flag"].sum())
+                if not pairs_ext.empty and "extreme_flag" in pairs_ext.columns
+                else 0,
             }
         )
-    scope_sensitivity = pd.DataFrame(scope_sensitivity_rows)
+    extremes_sensitivity = pd.DataFrame(extremes_rows)
     timings["benchmarks"] = time.time() - stage
 
-    # Hierarchical model
+    # Hierarchical model with lambda grid selection
     stage = time.time()
+    logger.info("Selecting hierarchical regularization via inner backtest")
+    selected_lambdas, lambda_grid_table = select_lambdas_by_inner_backtest(
+        pairs, config, progress=lambda m: logger.info(m)
+    )
+    # Persist selected lambdas onto controls for Controls Used visibility
+    for k, v in selected_lambdas.items():
+        key = f"lambda_{k}" if not k.startswith("lambda_") else k
+        if hasattr(config.controls, key):
+            setattr(config.controls, key, float(v))
+            if key in config.sources:
+                config.sources[key].value = float(v)
+                config.sources[key].source = "InnerBacktest"
+                config.sources[key].description = (
+                    config.sources[key].description + " (selected by inner rolling WAPE)"
+                )
     logger.info("Fitting hierarchical repeat-sales model")
-    model = fit_repeat_sales(pairs, config)
+    model = fit_repeat_sales(pairs, config, lambdas_override=selected_lambdas)
     part_hier = compute_part_residuals(pairs, model, config)
     best_fc, fc_table = select_forecast_by_backtest(
         model.delta0, model.months, config.controls.horizon_months()
@@ -270,7 +355,9 @@ def run_pipeline(
         )
     else:
         logger.info("Running rolling backtests")
-        bt = run_backtests(classified, config, progress=lambda m: logger.info(m))
+        bt = run_backtests(
+            classified, config, progress=lambda m: logger.info(m), lambdas_override=selected_lambdas
+        )
     timings["backtest"] = time.time() - stage
 
     selected_model = bt.selected_model
@@ -305,9 +392,23 @@ def run_pipeline(
     last["lambda_shrink"] = last["lambda_shrink"].fillna(0.0)
     last["quality"] = last["quality"].fillna(0.0)
 
-    # Estimated base-date price via bridging (category-cached)
-    from parts_inflation.hierarchy import multiplier_category
+    # Apply ManualCurrentPrice as latest observed price at base date
+    mcp_map = (
+        classified.dropna(subset=["PartKey"])
+        .groupby("PartKey", as_index=False)["manual_current_price"]
+        .max()
+        if "manual_current_price" in classified.columns
+        else pd.DataFrame(columns=["PartKey", "manual_current_price"])
+    )
+    last = last.merge(mcp_map, on="PartKey", how="left")
+    has_mcp = last["manual_current_price"].notna() & (last["manual_current_price"] > 0)
+    last.loc[has_mcp, "latest_price"] = last.loc[has_mcp, "manual_current_price"]
+    last.loc[has_mcp, "latest_date"] = base_ts
+    last.loc[has_mcp, "price_override_reason"] = "ManualCurrentPrice"
+    if "price_override_reason" not in last.columns:
+        last["price_override_reason"] = ""
 
+    # Estimated base-date price via bridging (category-cached)
     cat_bridge_cache: dict[tuple, float] = {}
     base_prices = []
     staleness = []
@@ -330,10 +431,20 @@ def run_pipeline(
     last["estimated_base_price"] = base_prices
     last["price_staleness_days"] = staleness
 
-    # Composite weights
+    # Manual future qty map
+    mfq_map = (
+        classified.dropna(subset=["PartKey"])
+        .groupby("PartKey", as_index=False)["manual_future_quantity"]
+        .max()
+        if "manual_future_quantity" in classified.columns
+        else pd.DataFrame(columns=["PartKey", "manual_future_quantity"])
+    )
+    last = last.merge(mfq_map, on="PartKey", how="left")
+
+    # Composite weights (fixed basket q*)
     if not planned.empty:
         last = last.merge(planned[["PartKey", "ExpectedQuantity"]], on="PartKey", how="left")
-        last["q_star"] = last["ExpectedQuantity"].fillna(last["qty"])
+        last["q_star"] = last["ExpectedQuantity"]
     else:
         spend_w = (
             wdf.groupby("PartKey", as_index=False)["po_value"]
@@ -347,6 +458,13 @@ def run_pipeline(
             last["trail_spend"] / last["estimated_base_price"],
             last["qty"].fillna(0),
         )
+    # ManualFutureQuantity overrides assumed future qty; also fills q_star if missing
+    has_mfq = last["manual_future_quantity"].notna() & (last["manual_future_quantity"] > 0)
+    last["q_future"] = last["q_star"]
+    last.loc[has_mfq, "q_future"] = last.loc[has_mfq, "manual_future_quantity"]
+    last.loc[has_mfq & (last["q_star"].isna() | (last["q_star"] <= 0)), "q_star"] = last.loc[
+        has_mfq & (last["q_star"].isna() | (last["q_star"] <= 0)), "manual_future_quantity"
+    ]
 
     last["base_spend_weight_num"] = last["q_star"].fillna(0) * last["estimated_base_price"].fillna(0)
     total_base = last["base_spend_weight_num"].sum()
@@ -355,7 +473,7 @@ def run_pipeline(
     )
 
     # Uncertainty / forecasts from hierarchical challenger
-    logger.info("Computing uncertainty bootstrap")
+    logger.info("Computing part-cluster bootstrap uncertainty")
     weights = last.set_index("PartKey")["composite_weight"]
     weights = weights[weights > 0]
     unc = bootstrap_composite_and_parts(
@@ -369,49 +487,116 @@ def run_pipeline(
         selected_forecast=best_fc,
         model=model,
         part_hier=part_hier,
+        lambdas_override=selected_lambdas,
     )
 
-    # If backtests select a simpler model, override published composite/part multipliers
-    if selected_model == "last_price":
-        unc = dict(unc)
-        unc["composite_p10"] = 1.0
-        unc["composite_p50"] = 1.0
-        unc["composite_p90"] = 1.0
-        unc["point_composite"] = 1.0
-        unc["point_muls"] = {p: 1.0 for p in unc.get("point_muls", {})}
-        unc["part_p10"] = {p: 1.0 for p in unc.get("part_p10", {})}
-        unc["part_p50"] = {p: 1.0 for p in unc.get("part_p50", {})}
-        unc["part_p90"] = {p: 1.0 for p in unc.get("part_p90", {})}
-        unc["method"] = "selected_last_price_zero_inflation"
-        last["forecast_source"] = "last_price"
-        # Keep hierarchical fallback labels for weight-mix diagnostics
-        last["model_source"] = last["source"]
-    elif selected_model in {"matched_part", "tornqvist", "overall_cagr"}:
-        # Approximate selected benchmark as constant annualized rate from latest quarterly series
-        matched_q = benchmarks.get("matched_quarterly", pd.DataFrame())
-        tq = benchmarks.get("tornqvist_quarterly", pd.DataFrame())
-        years = max((target_ts - base_ts).days / 365.25, 1e-6)
-        if selected_model == "matched_part" and not matched_q.empty:
-            qrate = float(matched_q["capped_spend_weight_geom"].iloc[-1])
-            m = (1 + qrate) ** (years * 4)
-        elif selected_model == "tornqvist" and not tq.empty and tq["pct_change"].notna().any():
-            qrate = float(tq["pct_change"].dropna().iloc[-1])
-            m = (1 + qrate) ** (years * 4)
+    # Annualized rates for non-hierarchical per-part bridging
+    matched_q = benchmarks.get("matched_quarterly", pd.DataFrame())
+    tq = benchmarks.get("tornqvist_quarterly", pd.DataFrame())
+    matched_ann = 0.0
+    tq_ann = 0.0
+    if not matched_q.empty and "capped_spend_weight_geom" in matched_q.columns:
+        matched_ann = np.log1p(float(matched_q["capped_spend_weight_geom"].tail(4).mean())) * 4.0
+    if not tq.empty and "pct_change" in tq.columns and tq["pct_change"].notna().any():
+        tq_ann = np.log1p(float(tq["pct_change"].dropna().tail(4).mean())) * 4.0
+    from parts_inflation.backtest import _cagr_multiplier
+
+    cagr_m_full = _cagr_multiplier(daily, base_ts, target_ts)
+    years_bt = max((target_ts - base_ts).days / 365.25, 1e-6)
+
+    def _per_part_bridge_muls(model_name: str) -> dict[str, float]:
+        muls = {}
+        for _, r in last.iterrows():
+            part = r["PartKey"]
+            d_i = pd.Timestamp(r["latest_date"])
+            years_i = max((target_ts - d_i).days / 365.25, 0.0)
+            if model_name == "last_price":
+                muls[part] = 1.0
+            elif model_name == "matched_part":
+                muls[part] = float(np.exp(matched_ann * years_i))
+            elif model_name == "tornqvist":
+                muls[part] = float(np.exp(tq_ann * years_i))
+            elif model_name == "overall_cagr":
+                # Scale full-horizon CAGR to part-specific horizon from d_i
+                muls[part] = float(cagr_m_full ** (years_i / years_bt)) if years_bt > 0 else 1.0
+            elif model_name == "category_benchmark":
+                cat = str(r.get("category") or "overall")
+                muls[part] = multiplier_category(
+                    model, cat, d_i, target_ts, cand.monthly_rates, cand.months
+                )
+            else:
+                muls[part] = unc["point_muls"].get(part, 1.0)
+        return muls
+
+    if selected_model in {
+        "last_price",
+        "matched_part",
+        "tornqvist",
+        "overall_cagr",
+        "category_benchmark",
+    }:
+        point_muls = _per_part_bridge_muls(selected_model)
+        ww = weights.reindex(point_muls.keys()).fillna(0)
+        if ww.sum() > 0:
+            ww = ww / ww.sum()
+            point_comp = float(sum(ww[p] * point_muls[p] for p in ww.index))
         else:
-            m = float(unc["point_composite"])
+            point_comp = 1.0
+        # Use hierarchical bootstrap relative width around the selected point
+        rel_lo = unc["composite_p10"] / max(unc["point_composite"], 1e-9)
+        rel_hi = unc["composite_p90"] / max(unc["point_composite"], 1e-9)
         unc = dict(unc)
-        unc["composite_p50"] = m
-        unc["composite_p10"] = m * 0.95
-        unc["composite_p90"] = m * 1.05
-        unc["point_composite"] = m
-        unc["point_muls"] = {p: m for p in unc.get("point_muls", {})}
-        unc["part_p10"] = {p: m * 0.95 for p in unc.get("part_p10", {})}
-        unc["part_p50"] = {p: m for p in unc.get("part_p50", {})}
-        unc["part_p90"] = {p: m * 1.05 for p in unc.get("part_p90", {})}
-        unc["method"] = f"selected_{selected_model}"
+        unc["point_muls"] = point_muls
+        unc["point_composite"] = point_comp
+        unc["composite_p50"] = point_comp
+        unc["composite_p10"] = point_comp * rel_lo
+        unc["composite_p90"] = point_comp * rel_hi
+        unc["part_p50"] = dict(point_muls)
+        unc["part_p10"] = {p: m * rel_lo for p, m in point_muls.items()}
+        unc["part_p90"] = {p: m * rel_hi for p, m in point_muls.items()}
+        unc["method"] = f"selected_{selected_model}_per_part_bridge"
         last["source"] = selected_model
+    elif selected_model == "blended":
+        hier_muls = unc["point_muls"]
+        matched_muls = _per_part_bridge_muls("matched_part")
+        point_muls = {
+            p: 0.5 * hier_muls.get(p, 1.0) + 0.5 * matched_muls.get(p, 1.0)
+            for p in set(hier_muls) | set(matched_muls)
+        }
+        ww = weights.reindex(point_muls.keys()).fillna(0)
+        ww = ww / ww.sum() if ww.sum() > 0 else ww
+        point_comp = float(sum(ww[p] * point_muls[p] for p in ww.index)) if len(ww) else 1.0
+        rel_lo = unc["composite_p10"] / max(unc["point_composite"], 1e-9)
+        rel_hi = unc["composite_p90"] / max(unc["point_composite"], 1e-9)
+        unc = dict(unc)
+        unc["point_muls"] = point_muls
+        unc["point_composite"] = point_comp
+        unc["composite_p50"] = point_comp
+        unc["composite_p10"] = point_comp * rel_lo
+        unc["composite_p90"] = point_comp * rel_hi
+        unc["part_p50"] = dict(point_muls)
+        unc["part_p10"] = {p: m * rel_lo for p, m in point_muls.items()}
+        unc["part_p90"] = {p: m * rel_hi for p, m in point_muls.items()}
+        unc["method"] = "selected_blended_per_part_bridge"
+        last["source"] = "blended"
 
     timings["uncertainty"] = time.time() - stage
+
+    # Purchasing-cost projection (separate from fixed-basket inflation)
+    # C(T0) = sum q_future * p_base; C(T) = sum q_future * p_base * M_i
+    p50m_all = unc["part_p50"]
+    c_base = float(
+        (
+            last["q_future"].fillna(0) * last["estimated_base_price"].fillna(0)
+        ).sum()
+    )
+    c_target = 0.0
+    for _, r in last.iterrows():
+        part = r["PartKey"]
+        m = p50m_all.get(part, unc["point_muls"].get(part, 1.0))
+        c_target += float(r.get("q_future") or 0) * float(r.get("estimated_base_price") or 0) * float(m)
+    purchasing_cost_change = (c_target / c_base - 1.0) if c_base > 0 else np.nan
+    fixed_basket_cost_change = unc["composite_p50"] - 1.0
 
     # Part forecasts table — prioritize composite-weighted parts, cap huge exports
     part_rows = []
@@ -421,18 +606,24 @@ def run_pipeline(
     last_sorted = last.sort_values("composite_weight", ascending=False)
     max_parts = 20000 if not config.controls.fast_mode else 8000
     last_export = last_sorted.head(max_parts)
-    years_bt = max((target_ts - base_ts).days / 365.25, 0.0)
-    cat_fwd_cache: dict[str, float] = {}
+    # Source-line traces from latest classified observation
+    trace = (
+        classified.dropna(subset=["PartKey"])
+        .sort_values("po_date")
+        .groupby("PartKey", as_index=False)
+        .tail(1)[
+            [
+                c
+                for c in ["PartKey", "source_file", "source_sheet", "source_row_number", "Description 1", "Description 2", "raw_part_number"]
+                if c in classified.columns
+            ]
+        ]
+    )
+    last_export = last_export.merge(trace, on="PartKey", how="left")
+
     for _, r in last_export.iterrows():
         part = r["PartKey"]
-        cat = str(r.get("category") or "overall")
-        if cat not in cat_fwd_cache:
-            cat_fwd_cache[cat] = multiplier_category(
-                model, cat, base_ts, target_ts, cand.monthly_rates, cand.months
-            )
-        resid = float(r.get("shrunk_residual", 0.0) or 0.0)
-        m_point = cat_fwd_cache[cat] * float(np.exp(resid * years_bt))
-        m50 = p50m.get(part, unc["point_muls"].get(part, m_point))
+        m50 = p50m.get(part, unc["point_muls"].get(part, 1.0))
         m10 = p10m.get(part, m50 * 0.98)
         m90 = p90m.get(part, m50 * 1.02)
         m10, m50, m90 = widen_interval(
@@ -442,12 +633,16 @@ def run_pipeline(
         part_rows.append(
             {
                 "PartKey": part,
+                "raw_part_number": r.get("raw_part_number"),
+                "Description 1": r.get("Description 1"),
+                "Description 2": r.get("Description 2"),
                 "category": r.get("category"),
                 "latest_observed_price": r["latest_price"],
                 "latest_observed_date": r["latest_date"],
                 "estimated_base_date_price": base_p,
                 "price_staleness_days": r["price_staleness_days"],
-                "assumed_quantity": r.get("q_star"),
+                "assumed_quantity_q_star": r.get("q_star"),
+                "future_quantity_q_T": r.get("q_future"),
                 "target_price_p10": base_p * m10,
                 "target_price_p50": base_p * m50,
                 "target_price_p90": base_p * m90,
@@ -460,29 +655,26 @@ def run_pipeline(
                 "shrinkage_weight": r.get("lambda_shrink"),
                 "quality": r.get("quality"),
                 "composite_weight": r.get("composite_weight"),
+                "source_file": r.get("source_file"),
+                "source_sheet": r.get("source_sheet"),
+                "source_row_number": r.get("source_row_number"),
+                "price_override_reason": r.get("price_override_reason", ""),
             }
         )
     part_forecasts = pd.DataFrame(part_rows)
 
-    # Merge descriptions from classified
-    desc = (
-        classified.dropna(subset=["PartKey"])
-        .sort_values("po_date")
-        .groupby("PartKey", as_index=False)
-        .tail(1)[["PartKey", "Description 1", "Description 2", "raw_part_number"]]
-    )
-    part_forecasts = part_forecasts.drop(columns=["Description 1"], errors="ignore").merge(
-        desc, on="PartKey", how="left"
-    )
-
-    # Category results
+    # Category results from bootstrap category samples
+    cat_p10 = unc.get("category_p10", {})
+    cat_p50 = unc.get("category_p50", {})
+    cat_p90 = unc.get("category_p90", {})
     cat_rows = []
     for cat in sorted(set(last["category"].dropna().astype(str))):
-        m50 = multiplier_category(
-            model, cat, base_ts, target_ts, cand.monthly_rates, cand.months
+        m50 = cat_p50.get(
+            cat,
+            multiplier_category(model, cat, base_ts, target_ts, cand.monthly_rates, cand.months),
         )
-        # Bootstrap approx via overall composite noise scale
-        spread = max(unc["composite_p90"] - unc["composite_p10"], 0.02)
+        m10 = cat_p10.get(cat, m50 * 0.98)
+        m90 = cat_p90.get(cat, m50 * 1.02)
         cat_rows.append(
             {
                 "category": cat,
@@ -494,9 +686,9 @@ def run_pipeline(
                 )
                 if "approved_category" in wdf.columns
                 else np.nan,
-                "multiplier_p10": m50 - 0.5 * spread,
+                "multiplier_p10": m10,
                 "multiplier_p50": m50,
-                "multiplier_p90": m50 + 0.5 * spread,
+                "multiplier_p90": m90,
                 "stability_flag": "ok"
                 if (pairs["approved_category"] == cat).sum() >= config.controls.category_min_pairs
                 else "sparse",
@@ -504,19 +696,41 @@ def run_pipeline(
         )
     category_results = pd.DataFrame(cat_rows)
 
-    # Historical index sheet
-    hist_q = benchmarks.get("tornqvist_quarterly", pd.DataFrame()).copy()
-    matched_q = benchmarks.get("matched_quarterly", pd.DataFrame()).copy()
-    historical_index = hist_q
-    if not matched_q.empty:
-        historical_index = hist_q.merge(
-            matched_q[["period", "capped_spend_weight_geom", "match_count", "matched_spend"]],
-            on="period",
-            how="outer",
-            suffixes=("", "_matched"),
-        )
+    # Historical index: monthly, quarterly, annual series
+    hist_frames = []
+    for freq, matched_key, tq_key, fish_key in [
+        ("monthly", "matched_monthly", "tornqvist_monthly", "fisher_monthly"),
+        ("quarterly", "matched_quarterly", "tornqvist_quarterly", "fisher_quarterly"),
+        ("fiscal_year", "matched_fiscal_year", "tornqvist_fiscal_year", "fisher_fiscal_year"),
+    ]:
+        tq = benchmarks.get(tq_key, pd.DataFrame()).copy()
+        matched = benchmarks.get(matched_key, pd.DataFrame()).copy()
+        fish = benchmarks.get(fish_key, pd.DataFrame()).copy()
+        if tq.empty and matched.empty:
+            continue
+        frame = tq.copy() if not tq.empty else matched.copy()
+        frame["frequency"] = freq
+        if not matched.empty:
+            cols = [c for c in ["period", "capped_spend_weight_geom", "match_count", "matched_spend", "equal_weight_geom", "median_pct"] if c in matched.columns]
+            frame = frame.merge(matched[cols], on="period", how="outer", suffixes=("", "_matched"))
+        if not fish.empty and "fisher" in fish.columns:
+            frame = frame.merge(fish[["period", "fisher", "status"]].rename(columns={"status": "fisher_status"}), on="period", how="left")
+        # Hierarchical overall index aligned to months when available
+        if freq == "monthly" and model.n_pairs_used and len(model.delta0):
+            hier_idx = np.cumprod(np.concatenate([[1.0], np.exp(model.delta0)]))
+            hier_df = pd.DataFrame(
+                {
+                    "period": [str(m) for m in model.months],
+                    "hierarchical_index": hier_idx[1:],
+                    "hierarchical_log_change": model.delta0,
+                }
+            )
+            frame = frame.merge(hier_df, on="period", how="left")
+        hist_frames.append(frame)
+    historical_index = pd.concat(hist_frames, ignore_index=True) if hist_frames else pd.DataFrame()
 
-    # Chart data: historical index + forecast fan
+    # Chart data: prefer quarterly Törnqvist
+    hist_q = benchmarks.get("tornqvist_quarterly", pd.DataFrame()).copy()
     chart_rows = []
     if not hist_q.empty and "index" in hist_q.columns:
         for _, r in hist_q.iterrows():
@@ -534,7 +748,6 @@ def run_pipeline(
         last_idx = float(hist_q["index"].dropna().iloc[-1])
     else:
         last_idx = 1.0
-    # Append forecast points at target
     chart_rows.append(
         {
             "period": f"Forecast {target_d}",
@@ -555,11 +768,8 @@ def run_pipeline(
     pct_ov = float((last.loc[last["source"] == "overall", "composite_weight"].sum()))
     matched_cov = np.nan
     if not matched_q.empty and "matched_spend" in matched_q.columns:
-        # Coverage vs total spend in the latest matched quarter's window
         latest_end = pd.to_datetime(matched_q["period_end"].iloc[-1]) if "period_end" in matched_q.columns else None
         if latest_end is not None:
-            q_start = latest_end - pd.offsets.QuarterEnd(0) + pd.Timedelta(days=1) - pd.offsets.QuarterBegin(0)
-            # Approximate quarter window: last 90 days before period end
             window = daily.loc[
                 (pd.to_datetime(daily["po_date"]) > latest_end - pd.Timedelta(days=92))
                 & (pd.to_datetime(daily["po_date"]) <= latest_end)
@@ -567,8 +777,6 @@ def run_pipeline(
             denom = float(window["spend"].fillna(0).sum())
             numer = float(matched_q["matched_spend"].iloc[-1])
             matched_cov = numer / denom if denom > 0 else np.nan
-        else:
-            matched_cov = float(matched_q["match_count"].iloc[-1])
 
     controls_used = pd.DataFrame(
         [
@@ -581,8 +789,34 @@ def run_pipeline(
             for k, s in config.sources.items()
         ]
     )
+    # Append selected lambda keys explicitly
+    for k, v in selected_lambdas.items():
+        controls_used = pd.concat(
+            [
+                controls_used,
+                pd.DataFrame(
+                    [
+                        {
+                            "key": f"selected_lambda_{k}",
+                            "value": str(v),
+                            "source": "InnerBacktest",
+                            "description": "Selected by inner rolling WAPE grid search",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
 
-    dq = build_data_quality_table(cleaned, classified, pairs, infos, ingest_warnings + model.warnings)
+    dq = build_data_quality_table(
+        cleaned,
+        classified,
+        pairs,
+        infos,
+        ingest_warnings + model.warnings,
+        base_date=base_ts,
+        last_prices=last,
+    )
     summary = profile_summary(classified, infos)
     profile_cmp = compare_to_expected_profile(summary)
 
@@ -601,11 +835,15 @@ def run_pipeline(
             {"item": "selected_model", "value": selected_model},
             {"item": "selection_rationale", "value": bt.selection_rationale},
             {"item": "forecast_method", "value": best_fc},
+            {"item": "uncertainty_method", "value": unc.get("method")},
+            {"item": "selected_lambdas", "value": json.dumps(selected_lambdas)},
             {"item": "fingerprint", "value": fp},
             {"item": "total_rows", "value": summary["total_rows"]},
             {"item": "distinct_parts", "value": summary["distinct_parts"]},
             {"item": "adjacent_pairs", "value": len(pairs)},
             {"item": "model_warnings", "value": "; ".join(model.warnings)},
+            {"item": "fixed_basket_cost_change_p50", "value": fixed_basket_cost_change},
+            {"item": "purchasing_cost_change_p50", "value": purchasing_cost_change},
             {"item": "elapsed_seconds", "value": round(time.time() - t0, 2)},
         ]
         + [{"item": f"timing_{k}", "value": round(v, 2)} for k, v in timings.items()]
@@ -619,7 +857,6 @@ def run_pipeline(
         ]
     )
 
-    # Dependency versions
     try:
         import importlib.metadata as md
 
@@ -637,6 +874,16 @@ def run_pipeline(
     except Exception:
         pass
 
+    # Attach extremes sensitivity into scope sensitivity sheet area via separate payload
+    scope_sensitivity = pd.concat(
+        [
+            scope_sensitivity.assign(section="scope"),
+            extremes_sensitivity.assign(section="extremes", scope="selected_scope"),
+        ],
+        ignore_index=True,
+        sort=False,
+    )
+
     payload = {
         "dashboard": {
             "scope": config.controls.scope_mode.value,
@@ -647,13 +894,17 @@ def run_pipeline(
             "composite_p50": unc["composite_p50"],
             "composite_p90": unc["composite_p90"],
             "annualized_p50": ann,
-            "cost_change_p50": unc["composite_p50"] - 1.0,
+            "cost_change_p50": fixed_basket_cost_change,
+            "fixed_basket_inflation_p50": fixed_basket_cost_change,
+            "purchasing_cost_change_p50": purchasing_cost_change,
             "matched_spend_coverage": matched_cov,
             "pct_weight_part": pct_part,
             "pct_weight_category": pct_cat,
             "pct_weight_overall": pct_ov,
             "selected_model": selected_model,
+            "selection_rationale": bt.selection_rationale,
             "forecast_method": best_fc,
+            "uncertainty_method": unc.get("method"),
             "long_horizon_warning": long_warn or "None",
         },
         "controls_used": controls_used,
@@ -669,6 +920,7 @@ def run_pipeline(
         "run_information": run_information,
         "profile_comparison": profile_cmp,
         "forecast_selection": fc_table,
+        "lambda_grid": lambda_grid_table,
     }
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")

@@ -65,8 +65,9 @@ def compute_part_residuals(
     min_int = config.controls.part_min_intervals
     min_span = config.controls.part_min_span_days
 
-    for part, grp_idx in pairs.groupby("PartKey").groups.items():
-        idx = list(grp_idx)
+    work = pairs.reset_index(drop=True)
+    for part, grp in work.groupby("PartKey"):
+        idx = grp.index.to_numpy()
         ee = e[idx]
         dtt = dt[idx]
         aa = a[idx]
@@ -75,16 +76,16 @@ def compute_part_residuals(
         n_eff = float(np.sum(aa))
         span_days = float(
             (
-                pd.to_datetime(pairs.loc[idx, "date_b"]).max()
-                - pd.to_datetime(pairs.loc[idx, "date_a"]).min()
+                pd.to_datetime(work.loc[idx, "date_b"]).max()
+                - pd.to_datetime(work.loc[idx, "date_a"]).min()
             ).days
         )
         # Quality from dispersion and flags
-        extreme_share = float(pairs.loc[idx, "extreme_flag"].mean()) if "extreme_flag" in pairs else 0.0
-        qty_share = float(pairs.loc[idx, "qty_comparable"].mean()) if "qty_comparable" in pairs else 1.0
+        extreme_share = float(work.loc[idx, "extreme_flag"].mean()) if "extreme_flag" in work else 0.0
+        qty_share = float(work.loc[idx, "qty_comparable"].mean()) if "qty_comparable" in work else 1.0
         quality = float(np.clip((1 - extreme_share) * (0.5 + 0.5 * qty_share), 0, 1))
         n_pairs = len(idx)
-        cat = str(pairs.loc[idx[0], "approved_category"])
+        cat = str(work.loc[idx[0], "approved_category"])
 
         if n_pairs >= min_int and span_days >= min_span:
             lam = (n_eff / (n_eff + k)) * min(span_days / 730.0, 1.0) * quality
@@ -145,24 +146,30 @@ def multiplier_category(
         return 1.0
 
     hist_delta = model.category_monthly(category)
+    # Trailing mean of category deviation û_c for future months
+    u_hat = 0.0
+    if category in model.categories and model.u.size:
+        c_i = model.categories.index(category)
+        u_series = model.u[c_i]
+        if len(u_series):
+            window = min(12, len(u_series))
+            u_hat = float(np.mean(u_series[-window:]))
+
     log_sum = 0.0
     from parts_inflation.matched_pairs import fractional_month_weights
 
     wm = fractional_month_weights(a, b)
-    last_hist = model.months[-1]
     for m, f in wm.items():
         if m in model.months:
             i = model.months.index(m)
             log_sum += f * hist_delta[i]
         elif future_monthly is not None and future_months is not None and m in future_months:
             j = future_months.index(m)
-            # category future = overall future (category deviations not extrapolated)
-            log_sum += f * future_monthly[j]
+            # future_δ_c,m = future_δ_0,m + û_c
+            log_sum += f * (float(future_monthly[j]) + u_hat)
         elif future_monthly is not None and len(future_monthly):
-            # use last future rate for uncovered months
-            log_sum += f * future_monthly[-1]
+            log_sum += f * (float(future_monthly[-1]) + u_hat)
         else:
-            # use last historical rate
             log_sum += f * hist_delta[-1]
     return float(np.exp(log_sum))
 

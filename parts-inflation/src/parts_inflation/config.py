@@ -66,6 +66,8 @@ class SelectedModelMode(str, Enum):
     matched_part = "matched_part"
     last_price = "last_price"
     overall_cagr = "overall_cagr"
+    category_benchmark = "category_benchmark"
+    blended = "blended"
 
 
 class ControlDefaults(BaseModel):
@@ -174,7 +176,7 @@ CONTROL_DESCRIPTIONS: dict[str, str] = {
     "confidence_upper_quantile": "Upper confidence quantile (default 0.90)",
     "long_horizon_warning_months": "Horizons beyond this are labeled scenarios",
     "selected_model_mode": "best_backtest or force a specific model family",
-    "fast_mode": "Reduce bootstrap and hyperparameter grid for development",
+    "fast_mode": "Reduce bootstrap iterations and lambda grid size only (does not subsample pairs)",
     "material_wape_improvement": "Relative WAPE improvement required to prefer complexity",
     "extreme_ratio_low": "Flag price ratios below this over short intervals",
     "extreme_ratio_high": "Flag price ratios above this over short intervals",
@@ -456,7 +458,7 @@ def load_config(
 
     if controls.fast_mode:
         if "bootstrap_iterations" not in cli_overrides:
-            controls.bootstrap_iterations = min(controls.bootstrap_iterations, 20)
+            controls.bootstrap_iterations = min(controls.bootstrap_iterations, 10)
             sources["bootstrap_iterations"] = SettingSource(
                 controls.bootstrap_iterations, "Default", "Reduced by fast_mode"
             )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -154,6 +154,8 @@ def fit_repeat_sales(
     pairs: pd.DataFrame,
     config: ResolvedConfig,
     downweight_extremes: bool = True,
+    lambdas_override: Optional[dict[str, float]] = None,
+    max_iter_override: Optional[int] = None,
 ) -> RepeatSalesResult:
     warnings: list[str] = []
     if pairs is None or pairs.empty:
@@ -180,14 +182,7 @@ def fit_repeat_sales(
         ratio_high=ctrls.extreme_ratio_high,
         max_days=ctrls.extreme_ratio_max_days,
     )
-    # Development speed: fit on a spend-weighted subsample without changing definitions
-    if ctrls.fast_mode and len(pairs) > 25000:
-        wtmp = _pair_weights(pairs, ctrls.pair_weight_method)
-        rng = np.random.default_rng(ctrls.random_seed)
-        p = wtmp / wtmp.sum()
-        idx = rng.choice(len(pairs), size=25000, replace=False, p=p)
-        pairs = pairs.iloc[np.sort(idx)].reset_index(drop=True)
-        warnings.append("fast_mode subsampled pairs to 25,000 for hierarchical fit")
+    # Note: fast_mode must not subsample pairs (would change fundamental estimates).
 
     D, months = month_coverage_matrix(pairs)
     if len(months) == 0:
@@ -224,8 +219,8 @@ def fit_repeat_sales(
         "us": ctrls.lambda_us,
         "gamma": ctrls.lambda_gamma,
     }
-    # Shrink sparse categories more: inflate lambda_u for cats below min pairs
-    # (implemented by pre-scaling u columns — approximate via higher global lambda if many sparse)
+    if lambdas_override:
+        lambdas.update({k: float(v) for k, v in lambdas_override.items() if k in lambdas})
     R = _penalty_matrix(M, C, lambdas)
 
     # IRLS with Huber weights
@@ -234,7 +229,10 @@ def fit_repeat_sales(
     sigma = 1.0
     converged = False
     delta = ctrls.huber_delta
+    # Fewer IRLS iterations in fast_mode is a solver tolerance only (same data/objective).
     max_iter = 30 if not ctrls.fast_mode else 12
+    if max_iter_override is not None:
+        max_iter = int(max_iter_override)
 
     sqrt_w = np.sqrt(w)
     for it in range(max_iter):
@@ -307,6 +305,154 @@ def fit_repeat_sales(
         converged,
     )
     return result
+
+
+def lambda_candidate_grid(fast_mode: bool = False) -> list[dict[str, float]]:
+    """Documented small grid centered on ControlDefaults; fast_mode uses 3 points."""
+    if fast_mode:
+        return [
+            {"smooth": 10.0, "u": 5.0, "gamma": 2.0},
+            {"smooth": 5.0, "u": 2.0, "gamma": 1.0},
+            {"smooth": 20.0, "u": 10.0, "gamma": 4.0},
+        ]
+    return [
+        {"smooth": 10.0, "u": 5.0, "gamma": 2.0},
+        {"smooth": 5.0, "u": 5.0, "gamma": 2.0},
+        {"smooth": 20.0, "u": 5.0, "gamma": 2.0},
+        {"smooth": 10.0, "u": 2.0, "gamma": 2.0},
+        {"smooth": 10.0, "u": 10.0, "gamma": 2.0},
+        {"smooth": 10.0, "u": 5.0, "gamma": 1.0},
+        {"smooth": 10.0, "u": 5.0, "gamma": 4.0},
+        {"smooth": 5.0, "u": 2.0, "gamma": 1.0},
+        {"smooth": 20.0, "u": 10.0, "gamma": 4.0},
+    ]
+
+
+def select_lambdas_by_inner_backtest(
+    pairs: pd.DataFrame,
+    config: ResolvedConfig,
+    progress: Optional[Callable[[str], None]] = None,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """
+    Choose lambda_smooth / lambda_u / lambda_gamma via inner rolling-origin WAPE
+    on training history only (never the final target window).
+    """
+    from parts_inflation.forecast import build_forecast_candidates, select_forecast_by_backtest
+    from parts_inflation.hierarchy import compute_part_residuals, multiplier_category
+
+    ctrls = config.controls
+    grid = lambda_candidate_grid(ctrls.fast_mode)
+    default = {"smooth": ctrls.lambda_smooth, "u": ctrls.lambda_u, "gamma": ctrls.lambda_gamma}
+    if pairs is None or pairs.empty or len(pairs) < 50:
+        return default, pd.DataFrame([{"status": "insufficient_pairs", **default}])
+
+    work = pairs.copy()
+    work["date_b"] = pd.to_datetime(work["date_b"])
+    min_d = work["date_b"].min()
+    max_d = work["date_b"].max()
+    start = min_d + pd.DateOffset(months=12)
+    cutoffs = pd.date_range(start=start, end=max_d - pd.DateOffset(months=3), freq="QE")
+    if len(cutoffs) == 0:
+        cutoffs = pd.DatetimeIndex([start])
+    if ctrls.fast_mode:
+        cutoffs = cutoffs[-1:] if len(cutoffs) > 0 else cutoffs
+    else:
+        cutoffs = cutoffs[-4:] if len(cutoffs) > 4 else cutoffs
+
+    scores: dict[str, list[float]] = {str(i): [] for i in range(len(grid))}
+    for cutoff in cutoffs:
+        if progress:
+            progress(f"Lambda grid cutoff {cutoff.date()}")
+        train = work.loc[work["date_b"] <= cutoff].reset_index(drop=True)
+        future = work.loc[
+            (work["date_b"] > cutoff) & (work["date_b"] <= cutoff + pd.DateOffset(months=6))
+        ].reset_index(drop=True)
+        if len(train) < 30 or future.empty:
+            continue
+        # Hyperparameter search may use a spend-weighted train sample; final fit still uses all pairs.
+        train_fit = train
+        max_train = 15000 if ctrls.fast_mode else 40000
+        if len(train_fit) > max_train:
+            ww = train_fit["spend_b"].fillna(train_fit["price_b"] * train_fit["qty_b"].fillna(1)).clip(lower=0)
+            if ww.sum() > 0:
+                rng = np.random.default_rng(ctrls.random_seed)
+                p = (ww / ww.sum()).to_numpy()
+                idx = rng.choice(train_fit.index.to_numpy(), size=max_train, replace=False, p=p)
+                train_fit = train_fit.loc[idx].reset_index(drop=True)
+        # Evaluate on a spend-weighted sample of future pairs for speed
+        fut = future
+        if len(fut) > 400:
+            ww = fut["spend_b"].fillna(fut["price_b"] * fut["qty_b"].fillna(1)).clip(lower=0)
+            if ww.sum() > 0:
+                rng = np.random.default_rng(ctrls.random_seed)
+                p = (ww / ww.sum()).to_numpy()
+                idx = rng.choice(fut.index.to_numpy(), size=400, replace=False, p=p)
+                fut = fut.loc[idx]
+        for gi, cand_l in enumerate(grid):
+            model = fit_repeat_sales(train_fit, config, lambdas_override=cand_l)
+            if model.n_pairs_used == 0:
+                continue
+            part_hier = compute_part_residuals(train_fit, model, config)
+            ph = part_hier.set_index("PartKey") if not part_hier.empty else None
+            best_fc, _ = select_forecast_by_backtest(model.delta0, model.months, [3, 6])
+            cands = build_forecast_candidates(
+                model.delta0, model.months, cutoff + pd.DateOffset(months=6), cutoff
+            )
+            cand = next((c for c in cands if c.name == best_fc), cands[0])
+            preds = []
+            acts = []
+            qtys = []
+            cat_cache: dict = {}
+            for _, r in fut.iterrows():
+                part = r["PartKey"]
+                bd = pd.Timestamp(r["date_a"])
+                ad = pd.Timestamp(r["date_b"])
+                base_p = float(r["price_a"])
+                act_p = float(r["price_b"])
+                if part in (ph.index if ph is not None else []):
+                    prow = ph.loc[part]
+                    cat = str(prow.get("category", "overall"))
+                    resid = float(prow.get("shrunk_residual", 0.0) or 0.0)
+                else:
+                    cat = str(r.get("approved_category", "overall"))
+                    resid = 0.0
+                key = (cat, bd.normalize(), ad.normalize())
+                if key not in cat_cache:
+                    cat_cache[key] = multiplier_category(
+                        model, cat, bd, ad, cand.monthly_rates, cand.months
+                    )
+                years = max((ad - bd).days / 365.25, 0.0)
+                pred = base_p * cat_cache[key] * float(np.exp(resid * years))
+                preds.append(pred)
+                acts.append(act_p)
+                qtys.append(float(r.get("qty_b") or 1.0))
+            if not acts:
+                continue
+            yt = np.asarray(acts, dtype=float)
+            yp = np.asarray(preds, dtype=float)
+            q = np.asarray(qtys, dtype=float)
+            denom = np.sum(q * yt)
+            if denom <= 0:
+                continue
+            scores[str(gi)].append(float(np.sum(q * np.abs(yp - yt)) / denom))
+
+    rows = []
+    best_i = 0
+    best_score = float("inf")
+    for gi, cand_l in enumerate(grid):
+        vals = scores[str(gi)]
+        mean_wape = float(np.mean(vals)) if vals else float("inf")
+        rows.append({**cand_l, "mean_wape": mean_wape, "n_cutoffs": len(vals)})
+        if mean_wape < best_score:
+            best_score = mean_wape
+            best_i = gi
+    selected = dict(grid[best_i])
+    # Always include ridge/us from controls
+    selected.setdefault("ridge", ctrls.lambda_ridge)
+    selected.setdefault("us", ctrls.lambda_us)
+    table = pd.DataFrame(rows)
+    logger.info("Selected lambdas via inner backtest: %s (WAPE=%.4f)", selected, best_score)
+    return selected, table
 
 
 def predict_pair_log_change(result: RepeatSalesResult, pairs: pd.DataFrame) -> np.ndarray:

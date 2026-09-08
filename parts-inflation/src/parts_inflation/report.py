@@ -90,7 +90,11 @@ Adjacent same-part purchases only (not all pairs). For interval j of part i:
   D_j,m = fraction of calendar month m in (d_a, d_b]
   y_j = sum_m D_j,m (delta0_m + u_c,m) + (gamma0 + kappa_c) x_q,j + e_j
 Estimated with Huber IRLS and smoothness/ridge penalties on monthly rates and category deviations.
+Regularization lambdas (smooth, u, gamma) are selected by an inner rolling-origin WAPE grid on training
+history only; ridge and u-smoothness use configured defaults. fast_mode shrinks the grid and bootstrap
+iterations only — it does not subsample pairs.
 Quantity elasticity is shrunk toward zero and not forced to be negative.
+Future months use overall forecast rates plus the trailing-mean category deviation û_c.
 
 4. Part hierarchy / fallback
 1) Qualifying part-specific category + shrunk residual
@@ -102,16 +106,27 @@ Shrinkage: lambda = n_eff/(n_eff+k) * min(span/730,1) * quality
 Candidate future monthly log rates: trailing-12m mean, EWMA, damped Holt, mean reversion.
 Selected via rolling-origin backtests on historical monthly rates.
 
-6. Composite multiplier
-Fixed-basket weights from trailing-12-month PO Value (or Planned Basket if supplied):
-  M_composite = sum_i w_i M_i(T0, T)
-Quantity/mix changes are reported separately and never labeled as inflation.
+6. Composite multiplier vs purchasing cost
+Fixed-basket price inflation uses reference quantities q_i* (Planned Basket, ManualFutureQuantity, or
+trailing-12-month PO Value implied quantities):
+  M_composite = sum_i w_i M_i(T0, T),  w_i ∝ q_i* * p_hat_i(T0)
+Projected purchasing cost uses possibly different future quantities q_i(T):
+  C_hat(T) = sum_i q_i(T) * p_hat_i(T)
+Mix/quantity changes are never labeled as inflation; both concepts appear on the Dashboard.
 
 7. Uncertainty
-Part-cluster bootstrap (default 100 iterations, seed 42) yields P10/P50/P90.
-Intervals are widened for overall/category fallback, stale prices, and horizons > 24 months.
+Part-cluster bootstrap (default 100 iterations, seed 42): resample parts with replacement, keep all
+pairs for each sampled part, refit the hierarchical model, and recompute multipliers. Quantiles yield
+P10/P50/P90. Intervals are widened for overall/category fallback, stale prices, and horizons > 24 months.
 
-8. Limitations
+8. Backtesting and model selection
+Time-based rolling-origin validation (18+ months training, quarterly cutoffs). Models compared:
+last_price, overall_cagr, matched_part, tornqvist, category_benchmark, hierarchical, blended.
+Metrics: WAPE (price-only and quantity-conditional), WALE, MdAPE, directional accuracy, E_composite,
+and hierarchical interval coverage. A more complex model is selected only if it improves average WAPE
+by a material relative amount (default 1%) without materially worsening composite error.
+
+9. Limitations
 - ~4 years of history; FY2026 incomplete.
 - No supplier, currency, UoM, PO number, contract status, or facility fields.
 - Apparent price changes may include supplier switches, spec changes, currency, contracts, or UoM changes.
@@ -140,13 +155,16 @@ def write_results_workbook(path: Path, payload: dict[str, Any]) -> Path:
         ("Composite P50 / base multiplier", meta.get("composite_p50")),
         ("Composite P90 multiplier", meta.get("composite_p90")),
         ("Annualized implied inflation (P50)", meta.get("annualized_p50")),
-        ("Projected fixed-basket cost change (P50)", meta.get("cost_change_p50")),
+        ("Fixed-basket price inflation (P50)", meta.get("fixed_basket_inflation_p50", meta.get("cost_change_p50"))),
+        ("Projected purchasing-cost change (P50)", meta.get("purchasing_cost_change_p50")),
         ("Matched-spend coverage", meta.get("matched_spend_coverage")),
         ("% weight part-level", meta.get("pct_weight_part")),
         ("% weight category-level", meta.get("pct_weight_category")),
         ("% weight overall-level", meta.get("pct_weight_overall")),
         ("Selected model", meta.get("selected_model")),
+        ("Selection rationale", meta.get("selection_rationale")),
         ("Selected forecast method", meta.get("forecast_method")),
+        ("Uncertainty method", meta.get("uncertainty_method")),
         ("Long-horizon warning", meta.get("long_horizon_warning")),
     ]
     dash["A3"] = "Metric"
@@ -221,7 +239,7 @@ def write_results_workbook(path: Path, payload: dict[str, Any]) -> Path:
     meth["A3"] = METHODOLOGY_TEXT
     meth["A3"].alignment = Alignment(wrap_text=True, vertical="top")
     meth.column_dimensions["A"].width = 120
-    meth.row_dimensions[3].height = 420
+    meth.row_dimensions[3].height = 520
 
     run = wb.create_sheet("Run Information")
     run_info = payload.get("run_information", pd.DataFrame())
@@ -230,6 +248,10 @@ def write_results_workbook(path: Path, payload: dict[str, Any]) -> Path:
     # Profile comparison optional
     if payload.get("profile_comparison") is not None:
         add_sheet("Profile Check", payload["profile_comparison"])
+    if payload.get("lambda_grid") is not None:
+        add_sheet("Lambda Grid", payload["lambda_grid"])
+    if payload.get("forecast_selection") is not None:
+        add_sheet("Forecast Selection", payload["forecast_selection"])
 
     wb.save(path)
     logger.info("Wrote results workbook %s", path)

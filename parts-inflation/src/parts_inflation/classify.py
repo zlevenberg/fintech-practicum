@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from parts_inflation.config import (
@@ -146,6 +147,26 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
             adj = factor.notna() & (factor > 0)
             df.loc[adj, "price"] = df.loc[adj, "price"] / factor[adj]
             df.loc[adj, "qty"] = df.loc[adj, "qty"] * factor[adj]
+        # Part-level price/qty overrides are carried forward; applied at forecast time
+        # so historical pair estimation is not rewritten.
+        if "ManualCurrentPrice" in df.columns:
+            mcp = pd.to_numeric(df["ManualCurrentPrice"], errors="coerce")
+            use_mcp = mcp.notna() & (mcp > 0)
+            df["manual_current_price"] = np.where(use_mcp, mcp, np.nan)
+            df["price_override_reason"] = np.where(use_mcp, "ManualCurrentPrice", "")
+        else:
+            df["manual_current_price"] = np.nan
+            df["price_override_reason"] = ""
+        if "ManualFutureQuantity" in df.columns:
+            mfq = pd.to_numeric(df["ManualFutureQuantity"], errors="coerce")
+            use_mfq = mfq.notna() & (mfq > 0)
+            df["manual_future_quantity"] = np.where(use_mfq, mfq, np.nan)
+        else:
+            df["manual_future_quantity"] = np.nan
+    else:
+        df["manual_current_price"] = np.nan
+        df["manual_future_quantity"] = np.nan
+        df["price_override_reason"] = ""
 
     # Service-like descriptions should not be treated as physical merely due to part key
     labor_mask = df["service_like_description"].fillna(False) & df["Resolved Decision"].eq("Include")
@@ -174,6 +195,13 @@ def apply_scope_and_category(cleaned: pd.DataFrame, config: ResolvedConfig) -> t
         in_scope(d, c) for d, c in zip(df["Resolved Decision"], df["Physical Input Category"])
     ]
     df["model_eligible"] = df["included_for_pricing"] & df["in_selected_scope"]
+    # Parts with a manual current price remain eligible even without an observed price row
+    has_mcp = pd.to_numeric(df["manual_current_price"], errors="coerce").notna()
+    df.loc[has_mcp & df["in_selected_scope"], "model_eligible"] = True
+    df.loc[has_mcp & df["in_selected_scope"], "included_for_pricing"] = True
+    df.loc[has_mcp & df["in_selected_scope"], "usable_price_obs"] = True
+    df.loc[has_mcp & df["in_selected_scope"], "valid_price"] = True
+
 
     # Sensitivity scopes
     df["in_inventory_only"] = (
