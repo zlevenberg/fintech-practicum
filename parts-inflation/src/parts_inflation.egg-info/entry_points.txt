@@ -1,0 +1,2 @@
+[console_scripts]
+parts-inflation = parts_inflation.cli:app

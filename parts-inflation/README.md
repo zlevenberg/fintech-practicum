@@ -1,0 +1,127 @@
+# Parts Inflation Prototype
+
+Client-specific parts inflation estimation and forecasting from historical purchase-order data.
+
+Public CPI-style metrics often miss what a manufacturer actually pays for components. This prototype measures **repeat-purchase price change** for the same part numbers, separates quantity effects where possible, and produces part / category / composite forecasts with P10–P90 ranges—without requiring Microsoft Excel to be installed to run the model.
+
+## Requirements
+
+- Python **3.11+** (3.12 recommended)
+- macOS or Windows
+- The four PO history workbooks in `data/raw/` (`.xlsx` / `.xlsm`)
+
+## Quick start (macOS / Linux)
+
+```bash
+cd parts-inflation
+chmod +x setup_mac.sh run_mac.command
+./setup_mac.sh
+source .venv/bin/activate
+python -m parts_inflation.cli run \
+  --input-dir data/raw \
+  --config config/model_config.xlsx \
+  --output-dir outputs \
+  --target-date 2027-07-09
+```
+
+Or double-click `run_mac.command` after setup.
+
+## Quick start (Windows)
+
+```bat
+cd parts-inflation
+setup_windows.bat
+.venv\Scripts\activate
+python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
+```
+
+Or double-click `run_windows.bat` after setup.
+
+## CLI commands
+
+```bash
+python -m parts_inflation.cli init-config --input-dir data/raw --output config/model_config.xlsx
+python -m parts_inflation.cli profile --input-dir data/raw
+python -m parts_inflation.cli validate --input-dir data/raw --config config/model_config.xlsx
+python -m parts_inflation.cli backtest --input-dir data/raw --config config/model_config.xlsx
+python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --target-date 2027-07-09
+```
+
+Useful flags on `run`:
+
+| Flag | Purpose |
+|---|---|
+| `--fast-mode` | Fewer bootstrap iterations / lighter backtests for development |
+| `--no-cache` / `--rebuild-cache` | Bypass or rebuild Parquet caches |
+| `--skip-backtest` | Skip rolling backtests (still produces forecasts) |
+| `--scope-mode` | `inventory_only` \| `physical_inputs` \| `all_po_lines` |
+| `--base-date` / `--target-date` | Override config dates (`YYYY-MM-DD`) |
+| `--bootstrap-iterations` | Override uncertainty iterations |
+
+**Precedence:** explicit CLI flag → `model_config.xlsx` → code default.
+
+## Configuration workbook
+
+`config/model_config.xlsx` is created automatically on first run (or via `init-config`). It is **not** overwritten by results generation.
+
+Sheets:
+
+- **Controls** — scope, dates, weighting, winsorization, shrinkage, bootstrap, etc.
+- **Scope Mapping** — Bucket/Description → Include / Exclude / Needs Review (Manual Override always wins)
+- **Category Mapping** — optional physical-input category overrides
+- **Part Overrides** — include/exclude, replacement keys, UoM factors, manual prices/qty
+- **Planned Basket** — optional future quantity weights (else trailing-12m `PO Value`)
+
+Default scope is `physical_inputs`. `Needs Review` rows are excluded from that model but quantified in **Scope Sensitivity**.
+
+## Adding another annual workbook
+
+1. Copy the new `.xlsx` or `.xlsm` into `data/raw/` (any filename).
+2. Ensure it has the expected columns (or a sheet containing them; `Sheet2` is preferred).
+3. Optionally refresh scope mapping: `python -m parts_inflation.cli init-config ...` if new Bucket/Description pairs appeared (or edit Scope Mapping manually).
+4. Rebuild cache and rerun:
+
+```bash
+python -m parts_inflation.cli run --input-dir data/raw --config config/model_config.xlsx --output-dir outputs --rebuild-cache
+```
+
+Raw files are never modified. Macros in `.xlsm` are not executed.
+
+## Outputs
+
+Each run writes:
+
+- `outputs/parts_inflation_results_YYYY-MM-DD_HHMMSS.xlsx` — Dashboard, Controls Used, Scope Sensitivity, Historical Index, Category Results, Part Forecasts, Backtests, Scope Mapping, Data Quality, Methodology, Run Information
+- `outputs/logs/parts_inflation_*.log`
+
+## Tests
+
+```bash
+source .venv/bin/activate
+pytest -q
+# Include smoke test against real workbooks:
+pytest -q -m integration
+```
+
+## Honest limitations
+
+- Roughly four years of history; FY2026 is incomplete.
+- Supplier, currency, unit of measure, PO number, contract status, and facility are unavailable—so apparent price changes may include supplier switches, spec changes, currency, contracts, emergency buys, or UoM changes.
+- Most distinct parts are not observed across multiple fiscal years; category/overall fallback is common.
+- Horizons beyond 24 months are **scenarios** with widening uncertainty, not precise forecasts.
+- A client-approved scope/category map and planned basket would improve results materially.
+- Architecture is modular so older years and richer fields can be added without a rewrite.
+
+## Project layout
+
+```text
+parts-inflation/
+├── data/raw/          # place PO workbooks here
+├── data/cache/        # Parquet caches (safe to delete)
+├── config/            # model_config.xlsx
+├── src/parts_inflation/
+├── tests/
+├── outputs/
+├── requirements.txt
+└── README.md
+```
