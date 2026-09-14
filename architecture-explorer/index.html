@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Parts Inflation · Architecture Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="orb orb-a" aria-hidden="true"></div>
+  <div class="orb orb-b" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <div>
+        <p class="brand-kicker">Glenair · Direct-Cost Inflation</p>
+        <h1>Architecture Explorer</h1>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" class="chip" data-view="flow" aria-pressed="true">Data flow</button>
+      <button type="button" class="chip" data-view="modules">Modules</button>
+      <button type="button" class="chip" data-view="formulas">Formulas</button>
+      <button type="button" class="chip ghost" id="reset-view">Reset zoom</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="stage-panel" aria-label="Architecture diagram">
+      <div class="breadcrumb" id="breadcrumb">
+        <button type="button" data-crumb="root">System</button>
+      </div>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <svg id="flow-svg" viewBox="0 0 1280 720" role="img" aria-label="Interactive pipeline diagram">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--edge)" />
+            </marker>
+            <linearGradient id="edgeGlow" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#3d9b8f" stop-opacity="0" />
+              <stop offset="50%" stop-color="#5fd4c4" stop-opacity="1" />
+              <stop offset="100%" stop-color="#3d9b8f" stop-opacity="0" />
+            </linearGradient>
+            <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+              <feGaussianBlur stdDeviation="4" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+          </defs>
+          <g class="viewport">
+            <g id="edges"></g>
+            <g id="particles"></g>
+            <g id="nodes"></g>
+          </g>
+        </svg>
+        <div class="hint" id="canvas-hint">Click any stage to drill in · Esc to go up</div>
+      </div>
+      <aside class="legend">
+        <div><span class="swatch source"></span> Inputs</div>
+        <div><span class="swatch transform"></span> Transform</div>
+        <div><span class="swatch estimate"></span> Estimation</div>
+        <div><span class="swatch output"></span> Outputs</div>
+        <div><span class="swatch support"></span> Support / legacy</div>
+      </aside>
+    </section>
+
+    <aside class="detail-panel" id="detail-panel" aria-live="polite">
+      <div class="detail-empty" id="detail-empty">
+        <p class="detail-kicker">Select a node</p>
+        <h2>Follow the cost signal</h2>
+        <p>
+          This explorer maps the offline <strong>parts-inflation</strong> pipeline:
+          immutable PO Excel workbooks → clean &amp; classify → Huber repeat-sales →
+          committed overlay → fixed-basket forecasts → audited Excel/CSV/JSON.
+        </p>
+        <ul class="stat-row">
+          <li><strong>~9k</strong><span>LOC</span></li>
+          <li><strong>29</strong><span>modules</span></li>
+          <li><strong>0</strong><span>servers / APIs</span></li>
+        </ul>
+      </div>
+
+      <div class="detail-content hidden" id="detail-content">
+        <p class="detail-kicker" id="detail-layer"></p>
+        <h2 id="detail-title"></h2>
+        <p class="detail-file" id="detail-file"></p>
+        <p id="detail-desc"></p>
+
+        <div class="section" id="io-section">
+          <h3>Data in → out</h3>
+          <div class="io-grid">
+            <div>
+              <p class="io-label">Receives</p>
+              <ul id="detail-inputs"></ul>
+            </div>
+            <div>
+              <p class="io-label">Produces</p>
+              <ul id="detail-outputs"></ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="section hidden" id="formula-section">
+          <h3>Formulas</h3>
+          <div id="detail-formulas"></div>
+        </div>
+
+        <div class="section hidden" id="children-section">
+          <h3>Drill into</h3>
+          <div class="child-grid" id="detail-children"></div>
+        </div>
+
+        <div class="section hidden" id="funcs-section">
+          <h3>Key functions</h3>
+          <ul class="func-list" id="detail-funcs"></ul>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <section class="formula-gallery hidden" id="formula-gallery" aria-label="All formulas">
+    <div class="gallery-head">
+      <h2>Formula atlas</h2>
+      <p>Every published equation from the V2 methodology, grouped by pipeline stage.</p>
+    </div>
+    <div class="gallery-grid" id="gallery-grid"></div>
+  </section>
+
+  <section class="module-grid hidden" id="module-grid" aria-label="Module map">
+    <div class="gallery-head">
+      <h2>Module map</h2>
+      <p>Click a module to jump into its place in the data flow.</p>
+    </div>
+    <div class="modules" id="modules"></div>
+  </section>
+
+  <footer class="footer">
+    <p>Read-only explorer · does not modify <code>parts-inflation/</code> · sourced from docs/METHODOLOGY.md and src/</p>
+  </footer>
+
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="data.js"></script>
+  <script defer src="app.js"></script>
+</body>
+</html>
